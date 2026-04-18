@@ -394,7 +394,7 @@ int main() {
     time_t rawtime; time(&rawtime);
     long long export_ts = (long long)rawtime;
 
-    // 核心优化：原子级别安全写入机制
+    // 核心优化：安全写入机制
     std::string tempFilename = uigfFilename + ".tmp";
     HANDLE hOut = CreateFileA(tempFilename.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     
