@@ -243,7 +243,7 @@ int main() {
                     }
 
                     savedUid = std::string(ExtractJsonValue(bufferView, "uid", false));
-                    if (savedUid.empty()) savedUid = std::string(ExtractJsonValue(bufferView, "uid", true));
+                    savedUid.erase(std::remove(savedUid.begin(), savedUid.end(), '"'), savedUid.end());
                     auto tzStr = ExtractJsonValue(bufferView, "timezone", false);
                     if (!tzStr.empty()) std::from_chars(tzStr.data(), tzStr.data()+tzStr.size(), savedTimezone);
                     
@@ -339,7 +339,10 @@ int main() {
                     reachedExisting = true; return;
                 }
 
-                if (savedUid.empty()) savedUid = std::string(ExtractJsonValue(itemStr, "uid", true));
+                if (savedUid.empty()) {
+                    savedUid = std::string(ExtractJsonValue(itemStr, "uid", false));
+                    savedUid.erase(std::remove(savedUid.begin(), savedUid.end(), '"'), savedUid.end());
+                }
 
                 sessionIds.insert(s_it, id); 
 
@@ -409,7 +412,7 @@ int main() {
         w.Write("    \"version\": \"v4.2\"\n  },\n");
         
         w.Write("  \"nap\": [\n    {\n");
-        w.Write("      \"uid\": \""); w.Write(savedUid.empty() ? "0" : savedUid); w.Write("\",\n");
+        w.Write("      \"uid\": "); w.Write(savedUid.empty() ? "0" : savedUid); w.Write(",\n");
         w.Write("      \"timezone\": "); w.Write(I64ToStr(savedTimezone, numBuf)); w.Write(",\n");
         w.Write("      \"lang\": \""); w.Write(langStr); w.Write("\",\n");
         w.Write("      \"list\": [\n");
