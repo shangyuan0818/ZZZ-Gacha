@@ -2,7 +2,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <unordered_set>
+#include <deque>
 #include <algorithm>
 #include <ctime>
 #include <windows.h>
@@ -10,6 +10,9 @@
 #include <string_view>
 #include <charconv>
 #include <ranges>
+#include <memory_resource>
+#include <array>
+#include <numeric>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "User32.lib")
@@ -27,6 +30,7 @@ size_t FindJsonKey(std::string_view source, std::string_view key, size_t startPo
         startPos = pos + key.length();
     }
 }
+
 std::string_view ExtractJsonValue(std::string_view source, std::string_view key, bool isString) {
     size_t pos = FindJsonKey(source, key);
     if (pos == std::string_view::npos) return {};
@@ -45,6 +49,7 @@ std::string_view ExtractJsonValue(std::string_view source, std::string_view key,
         return source.substr(pos, endPos-pos);
     }
 }
+
 template<typename Callback>
 void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
     size_t pos = FindJsonKey(source, arrayKey);
@@ -84,7 +89,6 @@ std::string_view ExtractUrlParam(std::string_view url, std::string_view key) {
     return (end == std::string_view::npos) ? url.substr(pos) : url.substr(pos, end - pos);
 }
 
-// 从 URL 提取主机名 (https://HOST/path...)
 std::string_view ExtractHost(std::string_view url) {
     auto pos = url.find("://");
     if (pos == std::string_view::npos) return {};
@@ -93,9 +97,29 @@ std::string_view ExtractHost(std::string_view url) {
     return (end == std::string_view::npos) ? url.substr(pos) : url.substr(pos, end - pos);
 }
 
-struct UIGFItem {
-    std::string gacha_type, id, gacha_id, item_id, name, item_type, rank_type, time;
-    long long parsed_id = 0;
+// ---------------------------------------------------------
+// [数据结构层：面向数据设计 (SoA)]
+// ---------------------------------------------------------
+struct ExportDataSoA {
+    std::pmr::vector<long long> parsed_ids;
+    std::pmr::vector<std::string_view> raw_ids;
+    std::pmr::vector<std::string_view> gacha_ids;
+    std::pmr::vector<std::string_view> gacha_types;
+    std::pmr::vector<std::string_view> item_ids;
+    std::pmr::vector<std::string_view> names;
+    std::pmr::vector<std::string_view> item_types;
+    std::pmr::vector<std::string_view> rank_types;
+    std::pmr::vector<std::string_view> times;
+
+    explicit ExportDataSoA(std::pmr::polymorphic_allocator<std::byte> alloc)
+        : parsed_ids(alloc), raw_ids(alloc), gacha_ids(alloc), gacha_types(alloc), item_ids(alloc),
+          names(alloc), item_types(alloc), rank_types(alloc), times(alloc) {}
+
+    void reserve(size_t cap) {
+        parsed_ids.reserve(cap); raw_ids.reserve(cap); gacha_ids.reserve(cap);
+        gacha_types.reserve(cap); item_ids.reserve(cap); names.reserve(cap);
+        item_types.reserve(cap); rank_types.reserve(cap); times.reserve(cap);
+    }
 };
 
 std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
@@ -144,14 +168,14 @@ struct BufferedWriter {
             if(p<end){if(*p=='"')Write("\\\"",2);else if(*p=='\\')Write("\\\\",2);++p;} }
     }
     void WriteKV(std::string_view key, std::string_view val) {
-        Write("            \"",13); Write(key); Write("\": \"",4); WriteEscaped(val); Write("\"",1);
+        Write("            \"", 13); Write(key); Write("\": \"", 4); WriteEscaped(val); Write("\"", 1);
     }
 };
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
 
-    char urlBuffer[4096]; // authkey 很长，需要大 buffer
+    char urlBuffer[4096]; 
     printf("请输入您的绝区零抽卡记录链接 (getGachaLog URL):\n> ");
     if (!fgets(urlBuffer, sizeof(urlBuffer), stdin)) return 1;
     
@@ -182,84 +206,107 @@ int main() {
         {"5", "邦布频段"},
     };
     
+    // PMR：在 Stack 上开辟 2MB 内存池 (配合编译指令 /STACK:4194304)
+    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
+    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
+    std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
+
+    ExportDataSoA pulls(alloc);
+    pulls.reserve(10000); 
+
+    // 核心修复：使用 std::deque 彻底告别扩容时的内存指针失效
+    std::deque<std::string> networkPayloads;
+
+    std::pmr::vector<long long> local_safe_ids(&pool);
+    local_safe_ids.reserve(10000);
+
     std::string uigfFilename = "uigf_zzz.json";
-    std::vector<UIGFItem> allRecords;
-    std::unordered_set<long long> localIds;
     std::string savedUid;
     int savedTimezone = 0;
     
-    // 读取本地已有记录 (UIGF v4.2 格式)
     HANDLE hFile = CreateFileA(uigfFilename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    const char* mapData = nullptr;
+    HANDLE hMap = NULL;
+
     if (hFile != INVALID_HANDLE_VALUE) {
         DWORD fileSize = GetFileSize(hFile, NULL);
         if (fileSize != INVALID_FILE_SIZE && fileSize > 0) {
-            HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+            hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
             if (hMap) {
-                const char* mapData = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+                mapData = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
                 if (mapData) {
-                    std::string_view bv(mapData, fileSize);
-                    // 提取 uid 和 timezone
-                    savedUid = std::string(ExtractJsonValue(bv, "uid", false));
-                    if (savedUid.empty()) savedUid = std::string(ExtractJsonValue(bv, "uid", true));
-                    auto tzStr = ExtractJsonValue(bv, "timezone", false);
+                    std::string_view bufferView(mapData, fileSize);
+                    
+                    // 修复 UTF-8 BOM 导致读取失败的问题
+                    if (bufferView.size() >= 3 && (unsigned char)bufferView[0] == 0xEF && (unsigned char)bufferView[1] == 0xBB && (unsigned char)bufferView[2] == 0xBF) {
+                        bufferView.remove_prefix(3);
+                    }
+
+                    savedUid = std::string(ExtractJsonValue(bufferView, "uid", false));
+                    if (savedUid.empty()) savedUid = std::string(ExtractJsonValue(bufferView, "uid", true));
+                    auto tzStr = ExtractJsonValue(bufferView, "timezone", false);
                     if (!tzStr.empty()) std::from_chars(tzStr.data(), tzStr.data()+tzStr.size(), savedTimezone);
                     
-                    // UIGF v4.2: data 在 nap[0].list 里, ForEachJsonObject 搜索 "list" 即可
-                    ForEachJsonObject(bv, "list", [&](std::string_view itemStr) {
-                        UIGFItem u;
-                        u.gacha_type = std::string(ExtractJsonValue(itemStr, "gacha_type", true));
-                        u.id = std::string(ExtractJsonValue(itemStr, "id", true));
-                        u.gacha_id = std::string(ExtractJsonValue(itemStr, "gacha_id", true));
-                        u.item_id = std::string(ExtractJsonValue(itemStr, "item_id", true));
-                        u.name = std::string(ExtractJsonValue(itemStr, "name", true));
-                        u.item_type = std::string(ExtractJsonValue(itemStr, "item_type", true));
-                        u.rank_type = std::string(ExtractJsonValue(itemStr, "rank_type", true));
-                        u.time = std::string(ExtractJsonValue(itemStr, "time", true));
-                        if (!u.id.empty()) std::from_chars(u.id.data(), u.id.data()+u.id.size(), u.parsed_id);
-                        localIds.insert(u.parsed_id);
-                        allRecords.push_back(std::move(u));
+                    ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
+                        std::string_view raw_id = ExtractJsonValue(itemStr, "id", true);
+                        long long parsed_id = 0;
+                        if (!raw_id.empty()) std::from_chars(raw_id.data(), raw_id.data() + raw_id.size(), parsed_id);
+                        
+                        pulls.parsed_ids.push_back(parsed_id);
+                        pulls.raw_ids.push_back(raw_id);
+                        pulls.gacha_types.push_back(ExtractJsonValue(itemStr, "gacha_type", true));
+                        pulls.gacha_ids.push_back(ExtractJsonValue(itemStr, "gacha_id", true));
+                        pulls.item_ids.push_back(ExtractJsonValue(itemStr, "item_id", true));
+                        pulls.names.push_back(ExtractJsonValue(itemStr, "name", true));
+                        pulls.item_types.push_back(ExtractJsonValue(itemStr, "item_type", true));
+                        pulls.rank_types.push_back(ExtractJsonValue(itemStr, "rank_type", true));
+                        pulls.times.push_back(ExtractJsonValue(itemStr, "time", true));
+
+                        local_safe_ids.push_back(parsed_id);
                     });
-                    UnmapViewOfFile(mapData);
                 }
-                CloseHandle(hMap);
             }
         }
-        CloseHandle(hFile);
-        printf("成功加载本地存储的 %zu 条抽卡记录。\n", allRecords.size());
+        printf("成功加载本地存储的 %zu 条抽卡记录。\n", pulls.parsed_ids.size());
     } else {
         printf("未发现本地记录，将创建新文件。\n");
     }
+
+    // 核心优化：纯粹利用自然二分查找
+    std::ranges::sort(local_safe_ids);
 
     printf("\n========================================\n");
     printf("       开始向服务器拉取调频数据\n");
     printf("========================================\n");
 
     HINTERNET hSession = WinHttpOpen(L"ZZZ Gacha Tool", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    HINTERNET hConnect = hSession ? WinHttpConnect(hSession, Utf8ToWstring(host).c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0) : NULL;
+    HINTERNET hConnect = hSession ? WinHttpConnect(hSession, Utf8ToWstring(std::string(host)).c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0) : NULL;
     if (!hConnect) { printf("网络初始化失败！\n"); system("pause"); return 1; }
 
-    std::unordered_set<long long> sessionIds;
+    std::pmr::vector<long long> sessionIds(&pool); 
+    sessionIds.reserve(2000);
+
     std::string authkeyStr(authkey), gameBizStr(gameBiz), regionStr(region), langStr(lang);
-    
-    // 构建公共查询参数 (authkey 已经是 URL-encoded)
     std::string commonParams = "authkey_ver=1&sign_type=2&authkey=" + authkeyStr 
         + "&game_biz=" + gameBizStr + "&region=" + regionStr + "&lang=" + langStr + "&size=20";
 
-    for (const auto& pool : pools) {
-        printf("\n>>> 正在抓取 [%s] ...\n", pool.displayName.c_str());
+    for (const auto& poolCfg : pools) {
+        printf("\n>>> 正在抓取 [%s] ...\n", poolCfg.displayName.c_str());
         bool reachedExisting = false;
         std::string endId;
         int page = 1, poolFetchedCount = 0;
 
         while (!reachedExisting) {
             std::string path = "/common/gacha_record/api/getGachaLog?" + commonParams 
-                + "&real_gacha_type=" + pool.gachaType
+                + "&real_gacha_type=" + poolCfg.gachaType
                 + "&end_id=" + endId;
 
-            std::string resStr = FetchPath(hConnect, Utf8ToWstring(path));
-            if (resStr.empty()) { printf("  [错误] 网络请求失败。\n"); break; }
+            // 数据存入 Deque，保证生命周期
+            networkPayloads.emplace_back(FetchPath(hConnect, Utf8ToWstring(path)));
+            std::string_view resView = networkPayloads.back();
 
-            std::string_view resView(resStr);
+            if (resView.empty()) { printf("  [错误] 网络请求失败。\n"); break; }
+
             auto retcode = ExtractJsonValue(resView, "retcode", false);
             if (retcode != "0") {
                 auto msg = ExtractJsonValue(resView, "message", true);
@@ -267,7 +314,6 @@ int main() {
                 break;
             }
 
-            // 检查是否有数据 (HoYo API: 空 list 表示没有更多数据)
             bool gotItems = false;
             std::string lastId;
             
@@ -280,38 +326,39 @@ int main() {
                 if (!idStr.empty()) std::from_chars(idStr.data(), idStr.data()+idStr.size(), id);
                 lastId = std::string(idStr);
 
-                if (localIds.contains(id)) {
+                auto it = std::ranges::lower_bound(local_safe_ids, id);
+                if (it != local_safe_ids.end() && *it == id) {
                     reachedExisting = true;
                     printf("  * 触达本地老记录 (ID: %lld)，停止追溯。\n", id);
                     return;
                 }
-                if (sessionIds.contains(id)) {
+                
+                auto s_it = std::ranges::lower_bound(sessionIds, id);
+                if (s_it != sessionIds.end() && *s_it == id) {
                     printf("  [警告] 遇到重复数据 (ID: %lld)，中止。\n", id);
                     reachedExisting = true; return;
                 }
 
-                UIGFItem u;
-                u.gacha_type = std::string(ExtractJsonValue(itemStr, "gacha_type", true));
-                u.id = std::string(idStr);
-                u.parsed_id = id;
-                u.gacha_id = std::string(ExtractJsonValue(itemStr, "gacha_id", true));
-                u.item_id = std::string(ExtractJsonValue(itemStr, "item_id", true));
-                u.name = std::string(ExtractJsonValue(itemStr, "name", true));
-                u.item_type = std::string(ExtractJsonValue(itemStr, "item_type", true));
-                u.rank_type = std::string(ExtractJsonValue(itemStr, "rank_type", true));
-                u.time = std::string(ExtractJsonValue(itemStr, "time", true));
-                
-                // 提取 uid (从第一条记录)
-                if (savedUid.empty()) {
-                    savedUid = std::string(ExtractJsonValue(itemStr, "uid", true));
-                }
+                if (savedUid.empty()) savedUid = std::string(ExtractJsonValue(itemStr, "uid", true));
 
-                sessionIds.insert(id);
-                allRecords.push_back(std::move(u));
+                sessionIds.insert(s_it, id); 
+
+                pulls.parsed_ids.push_back(id);
+                pulls.raw_ids.push_back(idStr);
+                pulls.gacha_types.push_back(ExtractJsonValue(itemStr, "gacha_type", true));
+                pulls.gacha_ids.push_back(ExtractJsonValue(itemStr, "gacha_id", true));
+                pulls.item_ids.push_back(ExtractJsonValue(itemStr, "item_id", true));
+                pulls.names.push_back(ExtractJsonValue(itemStr, "name", true));
+                pulls.item_types.push_back(ExtractJsonValue(itemStr, "item_type", true));
+                pulls.rank_types.push_back(ExtractJsonValue(itemStr, "rank_type", true));
+                pulls.times.push_back(ExtractJsonValue(itemStr, "time", true));
+
                 poolFetchedCount++;
-                printf("  获取到: %s (%s) [%s] - %s\n", 
-                    allRecords.back().name.c_str(), allRecords.back().rank_type.c_str(),
-                    allRecords.back().item_type.c_str(), allRecords.back().time.c_str());
+                printf("  获取到: %.*s (%.*s 星) [%.*s] - %.*s\n", 
+                    (int)pulls.names.back().size(), pulls.names.back().data(), 
+                    (int)pulls.rank_types.back().size(), pulls.rank_types.back().data(), 
+                    (int)pulls.item_types.back().size(), pulls.item_types.back().data(),
+                    (int)pulls.times.back().size(), pulls.times.back().data());
             });
 
             if (reachedExisting || !gotItems) break;
@@ -319,7 +366,7 @@ int main() {
             page++;
             Sleep(300);
         }
-        printf(">>> [%s] 抓取完成，本次新增: %d 条。\n", pool.displayName.c_str(), poolFetchedCount);
+        printf(">>> [%s] 抓取完成，本次新增: %d 条。\n", poolCfg.displayName.c_str(), poolFetchedCount);
         Sleep(500);
     }
 
@@ -329,10 +376,13 @@ int main() {
     printf("\n========================================\n");
     printf("已完成！总计新增 %zu 条记录。\n", sessionIds.size());
 
-    // 按 id 排序 (HoYo 的 id 本身就是时间序)
-    std::ranges::sort(allRecords, {}, [](const UIGFItem& a) { return a.parsed_id; });
+    // 创建索引数组进行排序
+    std::pmr::vector<size_t> indices(pulls.parsed_ids.size(), &pool);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::ranges::sort(indices, [&](size_t a, size_t b) {
+        return pulls.parsed_ids[a] < pulls.parsed_ids[b];
+    });
 
-    // 提取 timezone (从 region 推断)
     if (savedTimezone == 0) {
         if (regionStr.find("cn") != std::string::npos) savedTimezone = 8;
         else if (regionStr.find("jp") != std::string::npos) savedTimezone = 9;
@@ -344,8 +394,10 @@ int main() {
     time_t rawtime; time(&rawtime);
     long long export_ts = (long long)rawtime;
 
-    // UIGF v4.2 写入
-    HANDLE hOut = CreateFileA(uigfFilename.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    // 核心优化：原子级别安全写入机制
+    std::string tempFilename = uigfFilename + ".tmp";
+    HANDLE hOut = CreateFileA(tempFilename.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    
     if (hOut != INVALID_HANDLE_VALUE) {
         BufferedWriter w{hOut};
         char numBuf[24];
@@ -356,36 +408,50 @@ int main() {
         w.Write("    \"export_app_version\": \"v1.0.0\",\n");
         w.Write("    \"version\": \"v4.2\"\n  },\n");
         
-        // nap 数组
         w.Write("  \"nap\": [\n    {\n");
-        w.Write("      \"uid\": "); w.Write(savedUid.empty() ? "0" : savedUid); w.Write(",\n");
+        w.Write("      \"uid\": \""); w.Write(savedUid.empty() ? "0" : savedUid); w.Write("\",\n");
         w.Write("      \"timezone\": "); w.Write(I64ToStr(savedTimezone, numBuf)); w.Write(",\n");
         w.Write("      \"lang\": \""); w.Write(langStr); w.Write("\",\n");
         w.Write("      \"list\": [\n");
 
-        for (size_t i = 0; i < allRecords.size(); ++i) {
-            const auto& p = allRecords[i];
+        for (size_t i = 0; i < indices.size(); ++i) {
+            size_t idx = indices[i];
             w.Write("        {\n");
-            w.WriteKV("gacha_id", p.gacha_id); w.Write(",\n");
-            w.WriteKV("gacha_type", p.gacha_type); w.Write(",\n");
-            w.WriteKV("item_id", p.item_id); w.Write(",\n");
+            w.WriteKV("gacha_id", pulls.gacha_ids[idx]); w.Write(",\n");
+            w.WriteKV("gacha_type", pulls.gacha_types[idx]); w.Write(",\n");
+            w.WriteKV("item_id", pulls.item_ids[idx]); w.Write(",\n");
             w.Write("            \"count\": \"1\",\n");
-            w.WriteKV("time", p.time); w.Write(",\n");
-            w.WriteKV("name", p.name); w.Write(",\n");
-            w.WriteKV("item_type", p.item_type); w.Write(",\n");
-            w.WriteKV("rank_type", p.rank_type); w.Write(",\n");
-            w.WriteKV("id", p.id); w.Write("\n");
+            w.WriteKV("time", pulls.times[idx]); w.Write(",\n");
+            w.WriteKV("name", pulls.names[idx]); w.Write(",\n");
+            w.WriteKV("item_type", pulls.item_types[idx]); w.Write(",\n");
+            w.WriteKV("rank_type", pulls.rank_types[idx]); w.Write(",\n");
+            w.WriteKV("id", pulls.raw_ids[idx]); w.Write("\n");
             w.Write("        }");
-            if (i < allRecords.size() - 1) w.Write(",");
+            if (i < indices.size() - 1) w.Write(",");
             w.Write("\n");
         }
         
         w.Write("      ]\n    }\n  ]\n}\n");
         w.Flush();
         CloseHandle(hOut);
-        printf("已保存至: %s (UIGF v4.2)\n", uigfFilename.c_str());
+        
+        // 核心修复：临时文件落盘后，安全解除老文件锁
+        if (mapData) UnmapViewOfFile(mapData);
+        if (hMap) CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+        mapData = nullptr; hMap = NULL; hFile = INVALID_HANDLE_VALUE;
+
+        // 最后瞬间覆盖替换
+        if (MoveFileExA(tempFilename.c_str(), uigfFilename.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            printf("已成功更新记录并保存至: %s (UIGF v4.2)\n", uigfFilename.c_str());
+        } else {
+            printf("文件覆盖失败！请手动将 %s 重命名为 %s\n", tempFilename.c_str(), uigfFilename.c_str());
+        }
     } else {
-        printf("文件写入失败！\n");
+        printf("临时文件创建失败！请检查目录权限。\n");
+        if (mapData) UnmapViewOfFile(mapData);
+        if (hMap) CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
     }
 
     system("pause");
