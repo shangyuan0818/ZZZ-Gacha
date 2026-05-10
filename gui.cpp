@@ -202,8 +202,11 @@ inline std::string WideToUtf8(std::wstring_view wstr) {
     return result;
 }
 
-// 注意: UP 列表用 ASCII ',' 作分隔符; 不识别全角逗号(避免和池名内的全角逗号冲突)
-// 终末地版本里有同样的注释; 绝区零暂未见全角逗号池名, 但保持习惯一致.
+// 注意: UP 列表用 ASCII ',' 作分隔符; 不识别全角逗号 '，'(U+FF0C)。
+// 这是有意为之 —— 合法的角色名 / 物品名本身可能含全角符号(绝区零里「11号」
+// 用了全角引号「」, 未来也可能出现含全角逗号的名字), 把全角逗号当分隔符
+// 会导致这些条目被切碎、UP 识别失效。用户输入法切换的便利不值这个代价。
+// (与终末地版本同步设计, 该版本下注释已论证过这一选择)
 std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparatedUtf8(const std::wstring& text) {
     std::unordered_set<std::string, StringHash, std::equal_to<>> result;
     std::wstring cur;
@@ -221,6 +224,10 @@ std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparated
     return result;
 }
 
+// 上面 ParseCommaSeparatedUtf8 依赖 WideToUtf8 → 仅在主线程安全使用
+// (WideCharToMultiByte 本身 thread-safe, 但 GetWindowText 必须主线程,
+//  所以是分两步: 主线程提取 wstring + 转 utf8, 然后下面这个 FromUtf8 版
+//  在 worker 上跑)。下面是 utf8 直进版本:
 inline std::string TrimUtf8(std::string_view sv) {
     size_t b = sv.find_first_not_of(" \t\r\n");
     if (b == std::string_view::npos) return {};
@@ -229,6 +236,8 @@ inline std::string TrimUtf8(std::string_view sv) {
 }
 
 std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparatedUtf8FromUtf8(std::string_view text) {
+    // 与 wchar_t 版同步: 仅识别 ASCII ',' 作为分隔符, 不识别全角逗号。
+    // 理由见上方 ParseCommaSeparatedUtf8 的注释。
     std::unordered_set<std::string, StringHash, std::equal_to<>> result;
     std::string cur;
     for (size_t i = 0; i < text.size(); ++i) {
@@ -268,6 +277,8 @@ struct PullBucket {
     size_t size() const { return rank_types.size(); }
 };
 
+// alignas(128) 而非 64: Apple Silicon 与 Intel Sandy Bridge+ 上 spatial prefetcher
+// 会预取相邻 cacheline (128B), 用 128 对齐避免 false sharing 更稳妥
 struct alignas(128) StatsAccumulator {
     std::array<int, 200> freq_all{};   // ZZZ UP 上限可达 180 (大保底), 给 200 留富余
     std::array<int, 200> freq_up{};
@@ -275,6 +286,8 @@ struct alignas(128) StatsAccumulator {
     int count_all = 0, count_up = 0, count_win = 0;
     int max_pity_all = 0, max_pity_up = 0;
     int win_5050 = 0, lose_5050 = 0;
+    // 右删失: 循环结束时仍在累积、尚未结算的当前保底计数
+    // 生存分析里这些样本应参与分母 (risk set), 但不参与分子 (event)
     int censored_pity_all = 0;
     int censored_pity_up  = 0;
 };
@@ -290,6 +303,7 @@ struct StatsResult {
     std::array<double, 200> hazard_all{}, hazard_up{};
     double ks_d_all = 0.0, ks_d_up = 0.0;
     bool ks_is_normal = true, ks_is_normal_up = true;
+    // 右删失 (用于显示"当前已垫 N 抽")
     int censored_pity_all = 0;
     int censored_pity_up  = 0;
 };
@@ -333,6 +347,8 @@ static double g_cdf_wengine_up[162]= {};   // x=0..160,  音擎池 UP
 static bool   g_cdf_init           = false;
 
 void InitCDFTables() {
+    // 幂等保护: 多次调用只填充一次
+    // 注意: 为了避免另一线程读到"半初始化"的表, init 标记必须在末尾才置 true
     if (g_cdf_init) return;
 
     auto h_agent = [](int k) -> double {
@@ -429,13 +445,20 @@ void InitCDFTables() {
         g_cdf_wengine_up[full_cap + 1] = 1.0;
     }
 
-    g_cdf_init = true;
+    g_cdf_init = true;  // 末尾置位, 确保所有读者看到完整表
 }
 
 // 离散阶梯 CDF 的 K-S 统计量 (与终末地相同实现)
+//
+// 关键: 经验阶梯和理论阶梯都是不连续的, KS 统计量必须严格对齐两条阶梯。
+// 在 x 处, 两条阶梯的"底": F_n(cum before x), F_theory(x-1)
+// 在 x 处, 两条阶梯的"顶": F_n(cum after x),  F_theory(x)
+// 老式实现常拿"经验阶梯底"对"理论阶梯顶", 在软保底区间 hazard 单点跳跃
+// 5%+ 的位置会人为引入巨大伪偏差 —— 必须底对底、顶对顶分别测量。
 double ComputeKS(const std::array<int, 200>& freq, int max_pity, int n,
                  const double* cdf_table, int cdf_len) {
     if (n == 0) return 0.0;
+    // 防御性 clamp: freq 数组容量 200, max_pity 必须 < 200 否则越界读
     if (max_pity > 199) max_pity = 199;
     double max_d = 0.0;
     int cum_count = 0;
@@ -456,14 +479,29 @@ double ComputeKS(const std::array<int, 200>& freq, int max_pity, int n,
     return max_d;
 }
 
-// t 分布 95% 双侧临界值 (与终末地相同实现)
+// -------------------------------------------------------
+// 统计工具: t 分布 95% 双侧临界值 (α/2 = 0.025)
+// -------------------------------------------------------
+// 当样本量较小时 (N < 30), 标准正态 z=1.96 的 CI 会严重低估真实不确定性
+// (因为 t 分布尾部更厚)。严格的样本 CI 应该用 t_{α/2, N-1}
+//
+// 实现策略:
+//   df = 1, 2, 3, 4: 查表 (Hill 近似在低 df 误差较大, 最高 0.75%)
+//   df ≥ 5:          用 Hill(1970) 四阶渐近展开 (误差 < 0.02%)
+//   df → ∞ 时收敛到 z = 1.959964
 inline double TCritical95(int df) {
-    if (df <= 0) return 1.959963984540054;
+    if (df <= 0) return 1.959963984540054;  // 保护
+    // 低自由度查表 (值来自 scipy.stats.t.ppf(0.975, df))
     static constexpr double kTable[] = {
-        0.0, 12.706205, 4.302653, 3.182446, 2.776445,
+        0.0,        // df=0 占位
+        12.706205,  // df=1
+        4.302653,   // df=2
+        3.182446,   // df=3
+        2.776445,   // df=4
     };
     if (df <= 4) return kTable[df];
 
+    // Hill 1970 四阶展开
     constexpr double z = 1.959963984540054;
     constexpr double z2 = z * z;
     constexpr double z3 = z2 * z;
@@ -482,10 +520,15 @@ inline double TCritical95(int df) {
              + g4 * inv_d * inv_d * inv_d * inv_d;
 }
 
+// -------------------------------------------------------
+// 无偏样本方差 (贝塞尔校正): s² = [Σx² - (Σx)²/N] / (N-1)
+// 注意 N=1 时样本方差未定义 (除零), 返回 0
+// -------------------------------------------------------
 inline double SampleVariance(long long sum, long long sum_sq, int n) {
     if (n <= 1) return 0.0;
+    // 数值稳定式: 避免先算 mean 再做 E[X²]-E[X]² 的灾难性消去
     double numerator = (double)sum_sq - (double)sum * sum / (double)n;
-    if (numerator < 0.0) numerator = 0.0;
+    if (numerator < 0.0) numerator = 0.0;  // 浮点误差保护
     return numerator / (double)(n - 1);
 }
 
@@ -501,6 +544,11 @@ inline double SampleVariance(long long sum, long long sum_sq, int n) {
 //   1. 选择对应的理论 CDF 表
 //   2. 输出文本里的措辞
 //   不再像终末地那样切换"独立 25%"和"50/50 大保底"两种语义
+//
+// 重要差异 (相对终末地武器池): 因为代理人/音擎都有大保底, 所以两个池
+// 都启用 count_win/sum_win/avg_win 来统计"50/50 阶段成功毕业的期望"。
+// 终末地武器池因为是独立 25% 判定无大保底, avg_win 没有物理含义,
+// 所以保持 -1 不输出。这里两个池都会输出"赢下小保底 (不歪) 的出货期望"。
 //
 // UP 判定: 简单规则 — 出的 S 不在 standard_names 常驻名单里, 就是 UP.
 // 这个逻辑成立的前提:
@@ -567,9 +615,13 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
         current_pity = 0;
     }
 
+    // 右删失: 遍历结束时若仍有未结算的 pity, 记录为删失样本
+    // 这些抽数"存活"到了 current_pity 抽仍未出 S 级 (或 UP)
     acc.censored_pity_all = current_pity;
     acc.censored_pity_up  = pity_since_last_up;
 
+    // 防御性 clamp: 即使数据异常导致 max_pity / censored_pity > 199,
+    // 后续 ComputeKS 与 hazard 循环的索引访问也必须安全
     if (acc.max_pity_all > 199) acc.max_pity_all = 199;
     if (acc.max_pity_up  > 199) acc.max_pity_up  = 199;
     if (acc.censored_pity_all > 199) acc.censored_pity_all = 199;
@@ -587,12 +639,16 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
 
     if (acc.count_all > 0) {
         s.avg_all = (double)acc.sum_all / acc.count_all;
+        // 贝塞尔校正的无偏样本方差 s² = Σ(x-μ)² / (N-1)
+        // N=1 时 s² 未定义, SampleVariance 返回 0 (CI 也自然为 0)
         double var = SampleVariance(acc.sum_all, acc.sum_sq_all, acc.count_all);
         double std_all = std::sqrt(var);
         s.cv_all = (s.avg_all > 0) ? std_all / s.avg_all : 0;
+        // CI 使用 t 分布临界值 (自由度 N-1), 小样本下比 z=1.96 更保守正确
         double t_crit = TCritical95(acc.count_all - 1);
         s.ci_all_err = t_crit * std_all / std::sqrt((double)acc.count_all);
 
+        // K-S 检验: 代理人池用 g_cdf_agent, 音擎池用 g_cdf_wengine
         const double* cdf_tbl = isWEngine ? g_cdf_wengine : g_cdf_agent;
         int cdf_len = isWEngine ? 82 : 92;
         s.ks_d_all = ComputeKS(acc.freq_all, acc.max_pity_all, acc.count_all,
@@ -600,10 +656,15 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
         s.ks_is_normal = (s.ks_d_all <= (1.36 / std::sqrt((double)acc.count_all)));
     }
 
+    // Kaplan-Meier 式经验风险函数 - 综合 S 级:
+    //   risk set 初值 = 全部观测样本 (已毕业 + 删失)
+    //   到 x 抽时 hazard[x] = freq[x] / survivors
+    //   survivors 每步先减去事件 (freq[x]), 再减去在 x 发生的删失
+    // 即使 count_all=0 也要处理: 用户可能从未出 S 级但已垫 N 抽 (极少见但有效)
     if (acc.count_all > 0 || acc.censored_pity_all > 0) {
         int survivors = acc.count_all + (acc.censored_pity_all > 0 ? 1 : 0);
         int max_reach_all = (std::max)(acc.max_pity_all, acc.censored_pity_all);
-        if (max_reach_all > 199) max_reach_all = 199;
+        if (max_reach_all > 199) max_reach_all = 199;  // 防御性 clamp (已被上游保证, 这里再防一道)
         for (int x = 1; x <= max_reach_all; ++x) {
             if (survivors > 0) {
                 s.hazard_all[x] = (double)acc.freq_all[x] / survivors;
@@ -620,6 +681,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
         double t_crit = TCritical95(acc.count_up - 1);
         s.ci_up_err = t_crit * std_up / std::sqrt((double)acc.count_up);
 
+        // UP K-S 检验: 用 g_cdf_*_up 双状态前向迭代得到的 UP 分布
         const double* cdf_up_tbl = isWEngine ? g_cdf_wengine_up : g_cdf_agent_up;
         int cdf_up_len = isWEngine ? 162 : 182;
         s.ks_d_up = ComputeKS(acc.freq_up, acc.max_pity_up, acc.count_up,
@@ -627,10 +689,11 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
         s.ks_is_normal_up = (s.ks_d_up <= (1.36 / std::sqrt((double)acc.count_up)));
     }
 
+    // UP hazard 同理
     if (acc.count_up > 0 || acc.censored_pity_up > 0) {
         int survivors = acc.count_up + (acc.censored_pity_up > 0 ? 1 : 0);
         int max_reach_up = (std::max)(acc.max_pity_up, acc.censored_pity_up);
-        if (max_reach_up > 199) max_reach_up = 199;
+        if (max_reach_up > 199) max_reach_up = 199;  // 防御性 clamp
         for (int x = 1; x <= max_reach_up; ++x) {
             if (survivors > 0) {
                 s.hazard_up[x] = (double)acc.freq_up[x] / survivors;
@@ -664,24 +727,49 @@ struct ViewGuard {
     ~ViewGuard() { if (p) UnmapViewOfFile(p); }
 };
 
+// 安全读取动态长度的 Edit 控件文本
+// 固定 wchar_t[N] 在用户粘贴超长文本时会被 GetWindowTextW 截断,
+// 下游解析看到的是不完整数据 → 丢映射。先 GetWindowTextLengthW 查长度
+// 再按需分配, 彻底消除截断风险
 inline std::wstring GetDynamicWindowText(HWND hwnd) {
     int len = GetWindowTextLengthW(hwnd);
     if (len <= 0) return L"";
     std::wstring buf((size_t)len, L'\0');
-    GetWindowTextW(hwnd, buf.data(), len + 1);
+    GetWindowTextW(hwnd, buf.data(), len + 1);  // GetWindowTextW 需要 len+1 容纳末尾 '\0'
     return buf;
 }
 
 // ---------------------------------------------------------
 // [文件处理 - 工作线程化]
+//
+// 同步处理模式下 WM_DROPFILES 会阻塞窗口消息循环, 用户无法移动窗口/输入/
+// 最小化。这里改为异步:
+//   1) 主线程做 I/O 准备 (读 GUI 文本框 + mmap 文件)
+//   2) Worker 线程做纯 CPU 计算 (JSON 解析 + Calculate), 结果写入 heap
+//      上的 ProcessOutput 对象
+//   3) Worker 用 PostMessage(WM_APP_PROCESS_DONE) 把结果指针回投到主线程
+//   4) 主线程在该消息处理中更新 statsAgent/statsWEngine + UI, 然后 delete output
+//
+// 注意:
+//   - GDI / SetWindowTextW 都不是 thread-safe, 只能在主线程调
+//   - statsAgent/statsWEngine 是全局, WM_PAINT 通过 g_hChartBmp 间接读它们,
+//     但 g_hChartBmp 由 RebuildChartCache 重建, 所以只要 RebuildChartCache
+//     和 statsAgent 写入都在主线程串行, 就不需要锁
+//   - g_processing 标志防止 worker 跑时重复触发 (双开 worker)
 // ---------------------------------------------------------
 #define WM_APP_PROCESS_DONE  (WM_APP + 1)
 
+// 前向声明: RebuildChartCache 定义在 DrawECDF/DrawMRL 之后, 但 ProcessFile_Consume
+// 需要在文件中段调用它。
 void RebuildChartCache(HWND hwnd);
 
+// 跨线程载荷: 主线程构造, worker 填充结果, 主线程消费后 delete
 struct ProcessOutput {
-    HWND        hwnd_main = NULL;
+    HWND        hwnd_main = NULL;  // 主窗口, worker 用 PostMessage 回投到这里
 
+    // === 主线程预填 (由 ProcessFile_Submit 设置) ===
+    // 文件 buffer 用 mmap 直读, 零拷贝。三个 handle 必须存活到 Consume 阶段
+    // 才能 unmap/close, 因为 worker 内的 string_view 都指向 mmap 区域。
     HANDLE      hFile = INVALID_HANDLE_VALUE;
     HANDLE      hMap  = NULL;
     const void* viewPtr = nullptr;
@@ -696,6 +784,7 @@ struct ProcessOutput {
     std::string utf8_agentStd;
     std::string utf8_wengineStd;
 
+    // === worker 填充 ===
     bool        ok = false;
     StatsResult statsAgent;
     StatsResult statsWEngine;
@@ -703,14 +792,17 @@ struct ProcessOutput {
     std::wstring errMsg;
 
     ~ProcessOutput() {
+        // 主线程消费后调 delete 时统一清理 mmap 资源
         if (viewPtr) UnmapViewOfFile(viewPtr);
         if (hMap)    CloseHandle(hMap);
         if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
     }
 };
 
+// 用全局原子防双开; Win32 上 LONG volatile + InterlockedExchange 等价于 atomic_flag
 static volatile LONG g_processing = 0;
 
+// Worker 线程入口: 纯 CPU 工作, 不碰任何 GUI
 DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     auto* out = (ProcessOutput*)arg;
 
@@ -725,6 +817,12 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
         bufferView.remove_prefix(3);
     }
 
+    // PMR: 栈上 2MB 内存池
+    // worker 线程在 ProcessFile_Submit 中以 4MB 栈创建, 容得下这 2MB 缓冲区。
+    // 栈池 vs 堆池的性能差异:
+    //   - 分配/释放开销 0 (栈指针偏移 vs malloc 一次 2MB)
+    //   - 与 worker 栈的局部变量物理相邻, L1/L2 热, TLB 不会 miss
+    //   - 整个 PMR 工作集 (temps + bucketAgent + bucketWEngine) 都从此池分配, 锁在热区
     std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
     std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
@@ -878,17 +976,25 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     return 0;
 }
 
+// 主线程入口: 做 I/O 准备 + 启动 worker。
+// 返回 false 表示提交失败 (应立即清理), true 表示 worker 已启动
+// (WM_APP_PROCESS_DONE 会在完成时投递)。
 bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
+    // 双开保护: 用 InterlockedCompareExchange 原子地把 0->1
     if (InterlockedCompareExchange(&g_processing, 1, 0) != 0) {
-        return false;
+        return false;  // 已有 worker 在跑, 忽略本次拖入
     }
 
     auto out = std::make_unique<ProcessOutput>();
     out->hwnd_main = hwnd;
 
+    // 主线程读 GUI 控件文本 (子控件的 GetWindowTextW 不允许从 worker 调)
     out->utf8_agentStd   = WideToUtf8(GetDynamicWindowText(hAgentEdit));
     out->utf8_wengineStd = WideToUtf8(GetDynamicWindowText(hWEngineEdit));
 
+    // 主线程做文件 mmap, 所有权直接交给 ProcessOutput (零拷贝)。
+    // mmap view 在 worker 持有期间一直有效, Consume 阶段 ProcessOutput 析构统一 unmap。
+    // 失败路径下也由 unique_ptr<ProcessOutput> 析构正确清理 (已分配的资源)。
     out->hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (out->hFile == INVALID_HANDLE_VALUE) {
@@ -911,19 +1017,24 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
         return false;
     }
 
+    // 启动 worker. 显式指定 4MB 栈 (与主线程 /STACK:4194304 对齐;
+    // CreateThread 默认栈只 1MB, 容纳不下 worker 内部的 2MB PMR 栈池)。
+    // 注意: dwStackSize 是预留+commit, Windows 实际只 commit 必要页, 常驻内存仅约 1 页。
     HANDLE hThread = CreateThread(NULL, 4 * 1024 * 1024,
                                   ProcessFile_Worker, out.get(), 0, NULL);
     if (!hThread) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
-    CloseHandle(hThread);
-    out.release();
+    CloseHandle(hThread);  // 我们用 PostMessage 同步, 不需要 join
+    out.release();         // worker 接管所有权, 完成时主线程在 WM_APP_PROCESS_DONE 里 delete
     return true;
 }
 
+// 主线程消费 worker 结果. 必须在 WM_APP_PROCESS_DONE 里调用
 void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
     if (out->ok) {
+        // 把结果搬到全局 statsAgent/statsWEngine (主线程独占, 不需要锁)
         statsAgent   = out->statsAgent;
         statsWEngine = out->statsWEngine;
         SetWindowTextW(hOutEdit, out->outMsg.c_str());
@@ -936,7 +1047,7 @@ void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
               : out->errMsg.c_str());
     }
     delete out;
-    InterlockedExchange(&g_processing, 0);
+    InterlockedExchange(&g_processing, 0);  // 释放双开锁
 }
 // -------------------------------------------------------
 // 图形渲染
@@ -945,11 +1056,20 @@ void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
 // ---------------------------------------------------------
 // [ECDF (经验累积分布函数) 图]
 //
-// 设计同终末地版本: 离散阶梯线 + 理论 CDF 虚线 + KS 标记
+// 设计:
+//   - 离散阶梯线: ECDF(x) = (Σ_{k<=x} freq[k]) / total
+//   - 同时画综合 (蓝) 和 UP (红) 两条经验 ECDF + 两条理论 CDF (虚线)
+//   - 标记 KS 偏离最大处的 D 值竖线 (与 ks_d_all 一致, 用户可视化检验)
+//   - 右删失处理: ECDF 终点不到 1.0 (因为 censored_pity 表示当前未出货)
+//
 // 与终末地的差异:
 //   - 数组容量改为 200 (代理人 UP 池 CDF 长度可达 180+1)
-//   - 不再有 ecdf_up_step_size 参数: 绝区零没有"10 抽一组"的离散判定 (终末地
-//     武器池有, 因为它是十连绑定), 所有点都是单抽粒度, stepSize 恒为 1
+//   - 不再有 ecdf_up_step_size 参数: 绝区零没有"10 抽一组"的离散判定
+//     (终末地武器池有, 因为它是十连绑定), 所有点都是单抽粒度, stepSize 恒为 1
+//
+// 为什么用 ECDF 而非 KDE:
+//   抽卡数据是离散整数 pity, 样本量极小 (n ~10), KDE 的高斯核平滑会引入
+//   虚假的连续性 + 平滑过的尾部, ECDF 直接体现真实数据点的位置, 更诚实。
 // ---------------------------------------------------------
 void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
               const std::array<int, 200>& freq_all, const std::array<int, 200>& freq_up,
@@ -1024,8 +1144,22 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                      Gdiplus::PointF(px - xoff, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
     }
 
-    // 画理论 CDF (虚线, 折线模式 + 自动跳跃检测)
-    // 与终末地版本完全一致, 跳跃检测也完美适用于绝区零的"软保底响应"段
+    // 画理论 CDF (虚线).
+    //
+    // 自动跳跃检测: 用状态机决定折线 vs 阶梯
+    //   - 折线模式: Δ_k / Δ_{k-1} > JUMP_THRESHOLD (=5) → 进入阶梯模式
+    //   - 阶梯模式: Δ 持续上升 (Δ_k > Δ_{k-1}) → 保持阶梯; 否则退出回到折线
+    // 这样能正确表达"软保底响应到峰值"这一持续陡升过程, 而不只是把
+    // 触发跳跃的那一个点画成阶梯。
+    //
+    // 绝区零触发场景 (与终末地同样的机理):
+    //   代理人池: k=74 hazard 跳跃 (0.066/0.006 = 11x), 软保底响应区会触发阶梯
+    //   音擎池:   k=65 hazard 跳跃 (0.08/0.01 = 8x), 同上
+    //   两个池的跳跃比例都远大于阈值 5, 与终末地角色池软保底机理一致。
+    //
+    // 画法: 用 GraphicsPath 攒整条路径再一次性 stroke,
+    //       dash pattern 沿连续路径走, 跨拐角不重启;
+    //       LineJoin=Round 让拐角圆滑过渡, 缓解 dash 实部压在拐角的视觉错乱。
     auto drawTheoryCDF = [&](const double* cdf, int cdf_len, Gdiplus::Color color) {
         if (!cdf || cdf_len < 2) return;
         Gdiplus::Pen pen(color, DPIScaleF(1.5f));
@@ -1075,6 +1209,10 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         g.DrawPath(&pen, &path);
     };
 
+    // 画经验 ECDF (实阶梯线).
+    // 注: 删失观测 (用户当前还在垫的 cur_pity) 不画在 ECDF 上 ——
+    // 因为它还没事件化, 强行画一个标记反而误导 (会落在 ECDF 终点 y=100% 处)。
+    // MRL 图已经精确显示"已垫 X 抽 / 预期还需 Y 抽", 这里不重复。
     auto drawEmpiricalECDF = [&](const std::array<int, 200>& freq, int total,
                                   Gdiplus::Color color) {
         if (total == 0) return;
@@ -1099,7 +1237,15 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     drawEmpiricalECDF(freq_all, count_all, Gdiplus::Color(255, 65, 140, 240));
     drawEmpiricalECDF(freq_up,  count_up,  Gdiplus::Color(255, 240, 80, 80));
 
-    // KS 标记
+    // KS 标记 (双色, 综合蓝色标签左上 / UP 红色标签右下)
+    //
+    // 标签布局策略:
+    //   - 蓝色 (综合): 标签贴在 KS 虚线的左上方 (anchor 右下)
+    //   - 红色 (UP):   标签贴在 KS 虚线的右下方 (anchor 左上)
+    //   两个标签天然不会撞在一起, 颜色与对应 ECDF 实线一致, 用户能看出
+    //   "蓝色 KS 标签 → 测的是综合 ECDF 的偏离"。
+    //
+    // 标签自带白色描边 (4 偏移方向先画白色底字再叠主文本), 在彩色实线上的可读性更好。
     enum class KSLabelAnchor { LeftTop, RightBottom };
     auto drawKSMarker = [&](const std::array<int, 200>& freq, int total,
                             const double* cdf, int cdf_len,
@@ -1156,15 +1302,19 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     drawKSMarker(freq_up, count_up, theory_cdf_up, theory_cdf_up_len,
                  240, 80, 80, KSLabelAnchor::RightBottom);
 
-    // 图例
+    // 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论 CDF 虚线)
+    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行, 从右向左排,
+    // 这样图例完全位于标题区 (rect.Y+12 行), 不会下沉到绘图区 (rect.Y+40 起)。
+    // 旧版图例垂直堆叠 3 行, 最下面一项会落进绘图区与曲线重叠。
     Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
     Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
 
-    const wchar_t* legAll  = L"综合 S 级 ECDF";       // 综合 S 级 ECDF
-    const wchar_t* legUp   = L"当期限定 UP ECDF";  // 当期限定 UP ECDF
-    const wchar_t* legThy  = L"理论 CDF (综合)";  // 理论 CDF (综合)
+    const wchar_t* legAll  = L"综合 S 级 ECDF";
+    const wchar_t* legUp   = L"当期限定 UP ECDF";
+    const wchar_t* legThy  = L"理论 CDF (综合)";
 
+    // 测量文字宽度, 精确从右排 —— 不能用固定常量, 因为不同字体/DPI 下宽度不同
     auto measureW = [&](const wchar_t* s) -> float {
         Gdiplus::RectF box;
         g.MeasureString(s, -1, &legendFont, Gdiplus::PointF(0, 0), &box);
@@ -1210,6 +1360,19 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
 
 // ---------------------------------------------------------
 // [MRL (Mean Residual Life) 图]
+//
+// MRL(t) = E[X - t | X > t] —— "已经垫了 t 抽, 还要再垫多少抽的期望"
+//
+// 经验 MRL 计算 (从 freq 直方图):
+//   MRL_emp(t) = Σ_{k>t} (k-t)·freq[k] / Σ_{k>t} freq[k]
+//   分母 = 0 (即 t >= max_observed) 时 MRL 未定义
+//
+// 显示策略:
+//   - 实线: t 处至少有 2 个观测在分子里 (Σ_{k>t} freq[k] >= 2), 数值可靠
+//   - 半透明同色实线: 仅 1 个观测, 高方差区
+//   - 不画: 0 观测 (无意义)
+//   - 同时画理论 MRL (虚线): 基于理论 CDF 数值积分
+//   - 当前 censored_pity 位置画竖线 + "你在这里"标注 (用户决策视角的关键)
 // ---------------------------------------------------------
 void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
              const std::array<int, 200>& freq_all,
@@ -1245,11 +1408,13 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     }
     max_x = ((max_x / 10) + 1) * 10;
 
+    // ---- 计算经验 MRL 序列 (并记录每个 t 处的 surviving 计数) ----
     auto computeEmpiricalMRL = [&](const std::array<int, 200>& freq, int total)
         -> std::pair<std::array<double, 200>, std::array<int, 200>> {
-        std::array<double, 200> mrl{}; mrl.fill(-1.0);
+        std::array<double, 200> mrl{}; mrl.fill(-1.0);  // -1 = undefined
         std::array<int, 200> surv{}; surv.fill(0);
         if (total == 0) return {mrl, surv};
+        // 后缀和: 从最大 max_x 往回累加
         long long suf_count = 0, suf_weighted = 0;
         for (int t = max_x; t >= 0; --t) {
             surv[t] = (int)suf_count;
@@ -1293,9 +1458,11 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         if (theory_mrl_all[t] > max_y) max_y = theory_mrl_all[t];
         if (theory_mrl_up[t]  > max_y) max_y = theory_mrl_up[t];
     }
+    // 取整到 10 的倍数, 留 10% 顶部空间
     max_y = std::ceil(max_y * 1.1 / 10.0) * 10.0;
     if (max_y < 10) max_y = 10;
 
+    // ---- 网格 + 坐标轴 ----
     Gdiplus::Pen gridPen(Gdiplus::Color(255, 230, 230, 230), DPIScaleF(1.0f));
     Gdiplus::Pen axisPen(Gdiplus::Color(255, 80, 80, 80),  DPIScaleF(1.0f));
     float plotX = (float)rect.X + DPIScaleF(50.0f);
@@ -1335,6 +1502,9 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                      Gdiplus::PointF(px - xoff, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
     }
 
+    // ---- 画理论 MRL (虚线) ----
+    // 用 GraphicsPath 一次性 stroke, dash pattern 沿连续路径走。
+    // LineJoin=Round 让拐角圆滑, 缓解 dash 实部压在拐角的视觉错乱。
     auto drawTheoryMRL = [&](const std::array<double, 200>& tmrl, int cap, Gdiplus::Color color) {
         Gdiplus::Pen pen(color, DPIScaleF(1.5f));
         Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
@@ -1355,6 +1525,19 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     drawTheoryMRL(theory_mrl_all, theory_all_cap, Gdiplus::Color(180, 65, 140, 240));
     drawTheoryMRL(theory_mrl_up,  theory_up_cap,  Gdiplus::Color(180, 240, 80, 80));
 
+    // ---- 画经验 MRL ----
+    //
+    // 视觉编码:
+    //   surv >= 2: 满色实线 2.5pt   ← 多个独立样本支撑, 统计可靠
+    //   surv == 1: 半透明同色实线 1.8pt (alpha=115/255 ≈ 0.45)  ← 高方差区
+    //
+    // 历史: 之前 surv==1 段画虚线 (dash 4/3), 但红色 UP 理论 MRL 也是 dash 4/3,
+    //       两者撞色撞样式无法分辨。改成半透明实线后, 视觉编码错开:
+    //         "颜色淡 = 数据稀薄"   "虚线 = 理论参考"
+    //       两个语义彻底分开, 用户一眼能看出哪条是经验数据尾巴、哪条是理论曲线。
+    //
+    // 实现: 实线段和半透明段分别攒到两个 GraphicsPath, 各自一次性 stroke。
+    //       LineJoin=Round 让拐角圆滑过渡。
     auto drawEmpiricalMRL = [&](const std::pair<std::array<double, 200>, std::array<int, 200>>& mrl_data,
                                  BYTE r, BYTE gC, BYTE b) {
         const auto& mrl = mrl_data.first;
@@ -1388,7 +1571,18 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     drawEmpiricalMRL(mrl_all, 65, 140, 240);
     drawEmpiricalMRL(mrl_up,  240, 80, 80);
 
-    // "你在这里" 竖线
+    // ---- "你在这里" 竖线 (当前 censored_pity 位置) ----
+    // 关键设计:
+    //   - 综合 (蓝): 优先用综合理论 MRL, 否则降级到经验 MRL
+    //   - UP   (红): 同样优先用 UP 理论 MRL, 否则降级到经验 MRL。
+    //                有了精确的 UP 理论曲线后, 即使本次抽卡数据稀疏 / 全在
+    //                同一 censored 区段内, 标注线也能给出可靠参考。
+    //   - 虚线在 X 位置画出, 但标签固定在 plot 区域右上角竖排堆叠。
+    //     避免: 标签贴虚线时碰到 X=1 这种边界情况会被裁切, 也避免红蓝标签
+    //     互相重叠 (例如两个 censored 数值接近时)。
+    //     视觉对应: 标签自带颜色, 用户能看出"蓝色标签对应蓝色虚线"。
+
+    // (1) 先画虚线, 同时收集要展示的 (text, color) 条目
     struct CensoredLabel {
         std::wstring text;
         Gdiplus::Color color;
@@ -1427,10 +1621,14 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     resolveAndDrawLine(censored_all, mrl_all, theory_mrl_all, theory_all_cap, 65, 140, 240);
     resolveAndDrawLine(censored_up,  mrl_up,  theory_mrl_up,  theory_up_cap,  240, 80, 80);
 
+    // (2) 在 plot 区域右上角内侧固定位置堆叠标签
+    //     锚点右对齐, 行高约 14pt
+    //     图例改为水平横排后只占 rect.Y+12 那一行 (与 macOS/iOS 一致),
+    //     不再下沉到绘图区, 所以标签可以从 plotY+6 紧贴绘图区顶部起步。
     if (!censoredLabels.empty()) {
         Gdiplus::StringFormat fmtRight;
-        fmtRight.SetAlignment(Gdiplus::StringAlignmentFar);
-        fmtRight.SetLineAlignment(Gdiplus::StringAlignmentNear);
+        fmtRight.SetAlignment(Gdiplus::StringAlignmentFar);     // 水平右对齐
+        fmtRight.SetLineAlignment(Gdiplus::StringAlignmentNear); // 顶部对齐
 
         Gdiplus::SolidBrush whiteBr(Gdiplus::Color(255, 252, 253, 255));
 
@@ -1441,7 +1639,9 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         for (size_t i = 0; i < censoredLabels.size(); ++i) {
             const auto& entry = censoredLabels[i];
             float ly = anchorY + (float)i * lineHeight;
+            // 用一个点+右对齐 StringFormat 直接定位文字右上角
             Gdiplus::PointF pt(anchorX, ly);
+            // 白色描边: 4 个对角偏移画白底字提升可读性
             for (int dx = -1; dx <= 1; dx += 2) {
                 for (int dy = -1; dy <= 1; dy += 2) {
                     g.DrawString(entry.text.c_str(), -1, &tickFont,
@@ -1449,17 +1649,20 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                                  &fmtRight, &whiteBr);
                 }
             }
+            // 主文本
             Gdiplus::SolidBrush lblBrush(entry.color);
             g.DrawString(entry.text.c_str(), -1, &tickFont, pt, &fmtRight, &lblBrush);
         }
     }
 
-    // 图例 (与 ECDF 共用样式)
+    // ---- 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论值虚线) ----
+    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行, 从右向左排,
+    // 这样图例完全位于标题区, 不会下沉到绘图区。
     Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
     Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
 
-    const wchar_t* legAll  = L"综合 S 级 剩余期望";  // 综合 S 级 剩余期望
+    const wchar_t* legAll  = L"综合 S 级 剩余期望";
     const wchar_t* legUp   = L"当期限定 UP 剩余期望";
     const wchar_t* legThy  = L"理论值 (综合)";
 
@@ -1617,10 +1820,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t filePath[MAX_PATH];
         DragQueryFileW(hDrop, 0, filePath, MAX_PATH);
         DragFinish(hDrop);
+        // 异步提交; Submit 内部做双开保护 (g_processing CAS 锁)
+        // 失败 (已有 worker 在跑或 I/O 失败) 时静默忽略, UI 上保留之前的状态
         ProcessFile_Submit(hwnd, filePath);
         break;
     }
     case WM_APP_PROCESS_DONE: {
+        // worker 完成, 主线程消费结果 (更新全局 stats、刷新 UI)
         auto* out = (ProcessOutput*)lParam;
         ProcessFile_Consume(hwnd, out);
         break;
