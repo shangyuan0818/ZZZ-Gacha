@@ -442,12 +442,13 @@ int main() {
 
     std::deque<std::string> networkPayloads;
 
+    // 去重: unordered_set O(1) 查询, 比 vector linear scan O(n) 快得多
     std::pmr::unordered_set<long long> local_ids(alloc);
     local_ids.reserve(20000);
 
     std::string uigfFilename = "uigf_zzz.json";
 
-    // ---- 读取本地老记录 ----
+    // ---- 读取本地老记录 (读完立即释放句柄, 避免锁住目标文件) ----
     {
         FileHandle hFile;
         hFile.h = CreateFileA(uigfFilename.c_str(), GENERIC_READ,
@@ -462,10 +463,15 @@ int main() {
                     MapView view;
                     view.p = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
                     if (view.p) {
-                        // 拷到 deque 让 string_view 可在 mmap 关闭后继续有效
+                        // 关键: 把 mmap 数据复制到 networkPayloads, 让 string_view
+                        // 指向 deque 里的 string (deque push_back 不失效指针)。
+                        // 这样就可以立即关闭 mmap/file 句柄, 不会锁住目标文件导致
+                        // 后续 MoveFileExA 失败。
                         networkPayloads.emplace_back(
                             std::string((const char*)view.p, fileSize));
                         std::string_view bufferView = networkPayloads.back();
+
+                        // RAII Guard 会在退出本作用域时自动 unmap / close
 
                         if (bufferView.size() >= 3 &&
                             (unsigned char)bufferView[0] == 0xEF &&
@@ -513,7 +519,7 @@ int main() {
             printf("\xE6\x9C\xAA\xE5\x8F\x91\xE7\x8E\xB0\xE6\x9C\xAC\xE5\x9C\xB0\xE8\xAE\xB0\xE5\xBD\x95\xEF\xBC\x8C"
                    "\xE5\xB0\x86\xE5\x88\x9B\xE5\xBB\xBA\xE6\x96\xB0\xE6\x96\x87\xE4\xBB\xB6\xE3\x80\x82\n");
         }
-    }
+    }  // <- Guard 全部析构, 文件完全释放
 
     printf("\n========================================\n");
     printf("        \xE5\xBC\x80\xE5\xA7\x8B\xE5\x90\x91\xE6\x9C\x8D\xE5\x8A\xA1\xE5\x99\xA8\xE6\x8B\x89"
