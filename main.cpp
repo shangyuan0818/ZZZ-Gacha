@@ -36,7 +36,6 @@
 #include <charconv>
 #include <ranges>
 #include <memory_resource>
-#include <memory>
 #include <array>
 #include <numeric>
 #include <unordered_set>
@@ -72,9 +71,9 @@ inline bool ContainsCI(std::string_view haystack, std::string_view needle) {
 inline ItemType ParseItemType(std::string_view sv) {
     // zh-cn 下 API 返回中文 item_type 字段; 也兼容英文(en-us 等)
     // 中文短串直接 byte 级精确比较, 不做 lower (中文无大小写概念)
-    if (sv == "\xE4\xBB\xA3\xE7\x90\x86\xE4\xBA\xBA") return ItemType::Agent;     // 代理人
-    if (sv == "\xE9\x9F\xB3\xE6\x93\x8E")             return ItemType::WEngine;   // 音擎
-    if (sv == "\xE9\x82\xA6\xE5\xB8\x83")             return ItemType::Bangboo;   // 邦布
+    if (sv == "代理人") return ItemType::Agent;
+    if (sv == "音擎")   return ItemType::WEngine;
+    if (sv == "邦布")   return ItemType::Bangboo;
     // 防御性英文兼容 (Agents / W-Engines / Bangboos)
     if (ContainsCI(sv, "agent"))   return ItemType::Agent;
     if (ContainsCI(sv, "engine"))  return ItemType::WEngine;
@@ -84,9 +83,9 @@ inline ItemType ParseItemType(std::string_view sv) {
 
 inline std::string_view ItemTypeToStr(ItemType type) {
     // 输出 UIGF 文件时统一用中文, 与游戏内 / API 一致, 也与 zh-cn lang 自洽
-    if (type == ItemType::Agent)   return "\xE4\xBB\xA3\xE7\x90\x86\xE4\xBA\xBA";  // 代理人
-    if (type == ItemType::WEngine) return "\xE9\x9F\xB3\xE6\x93\x8E";              // 音擎
-    if (type == ItemType::Bangboo) return "\xE9\x82\xA6\xE5\xB8\x83";              // 邦布
+    if (type == ItemType::Agent)   return "代理人";
+    if (type == ItemType::WEngine) return "音擎";
+    if (type == ItemType::Bangboo) return "邦布";
     return "Unknown";
 }
 
@@ -369,16 +368,13 @@ int main() {
     // URL 缓冲区: 米哈游 authkey 是大段 percent-encoded 串, 单 authkey 就 ~1.5KB,
     // 完整 URL 加其它参数约 1.7KB. 给 16KB 留足富余 (栈数组, 不会爆栈).
     static char urlBuffer[16384];
-    printf("\xE8\xAF\xB7\xE8\xBE\x93\xE5\x85\xA5\xE6\x82\xA8\xE7\x9A\x84\xE7\xBB\x9D\xE5\x8C\xBA\xE9\x9B\xB6"
-           "\xE6\x8A\xBD\xE5\x8D\xA1\xE8\xAE\xB0\xE5\xBD\x95\xE5\xAE\x8C\xE6\x95\xB4\xE9\x93\xBE\xE6\x8E\xA5 "
-           "(\xE5\x90\xAB authkey \xE7\x9A\x84 URL):\n> ");
+    printf("请输入您的绝区零抽卡记录完整链接 (含 authkey 的 URL):\n> ");
     if (!fgets(urlBuffer, sizeof(urlBuffer), stdin)) return 1;
 
     // 截断检测: 如果读了 sizeof-1 字节但末尾不是 '\n', 说明 URL 比缓冲区还长
     size_t urlLen = strlen(urlBuffer);
     if (urlLen == sizeof(urlBuffer) - 1 && urlBuffer[urlLen - 1] != '\n') {
-        printf("\xE8\xAD\xA6\xE5\x91\x8A: \xE8\xBE\x93\xE5\x85\xA5\xE7\x9A\x84 URL \xE8\xB6\x85\xE8\xBF\x87 16KB\xEF\xBC\x8C"
-               "\xE5\x8F\xAF\xE8\x83\xBD\xE8\xA2\xAB\xE6\x88\xAA\xE6\x96\xAD\xE3\x80\x82\n");
+        printf("警告: 输入的 URL 超过 16KB，可能被截断。\n");
     }
 
     std::string_view inputUrl(urlBuffer);
@@ -393,7 +389,7 @@ int main() {
     auto authkeyVer  = ExtractUrlParam(inputUrl, "authkey_ver=");
     auto signType    = ExtractUrlParam(inputUrl, "sign_type=");
     if (authkey.empty()) {
-        printf("\xE9\x94\x99\xE8\xAF\xAF: \xE6\x97\xA0\xE6\xB3\x95\xE6\x8F\x90\xE5\x8F\x96 authkey\xE3\x80\x82\n");
+        printf("错误: 无法提取 authkey。\n");
         system("pause"); return 1;
     }
     if (authkeyVer.empty()) authkeyVer = "1";
@@ -411,30 +407,30 @@ int main() {
     std::wstring hostName;
     if (gameBiz == "nap_cn") {
         hostName = L"public-operation-nap.mihoyo.com";
-        printf("\xE5\xB7\xB2\xE8\xAF\x86\xE5\x88\xAB\xE5\x8C\xBA\xE6\x9C\x8D: \xE5\x9B\xBD\xE6\x9C\x8D (mihoyo)\n");
+        printf("已识别区服: 国服 (mihoyo)\n");
     } else {
         hostName = L"public-operation-nap-sg.hoyoverse.com";
-        printf("\xE5\xB7\xB2\xE8\xAF\x86\xE5\x88\xAB\xE5\x8C\xBA\xE6\x9C\x8D: \xE5\x9B\xBD\xE9\x99\x85\xE6\x9C\x8D (hoyoverse)\n");
+        printf("已识别区服: 国际服 (hoyoverse)\n");
     }
 
     // 4 个池子. 顺序: 限定代理人池 / 限定音擎池 / 邦布池 / 常驻池
     // 这个顺序是为了让"用户最关心的池子先抓"; 实际去重靠 id, 顺序不影响正确性.
     std::vector<PoolConfig> pools = {
-        {"2", "2", "2", "\xE7\x8B\xAC\xE5\xAE\xB6\xE9\xA2\x91\xE6\xAE\xB5 - \xE4\xBB\xA3\xE7\x90\x86\xE4\xBA\xBA UP"},   // 独家频段 - 代理人 UP
-        {"3", "3", "3", "\xE9\x9F\xB3\xE6\x93\x8E\xE9\xA2\x91\xE6\xAE\xB5 - \xE6\xAD\xA6\xE5\x99\xA8 UP"},               // 音擎频段 - 武器 UP
-        {"5", "5", "5", "\xE9\x82\xA6\xE5\xB8\x83\xE9\xA2\x91\xE6\xAE\xB5"},                                              // 邦布频段
-        {"1", "1", "1", "\xE5\xB8\xB8\xE9\xA9\xBB\xE9\xA2\x91\xE6\xAE\xB5"},                                              // 常驻频段
+        {"2", "2", "2", "独家频段 - 代理人 UP"},
+        {"3", "3", "3", "音擎频段 - 武器 UP"},
+        {"5", "5", "5", "邦布频段"},
+        {"1", "1", "1", "常驻频段"},
     };
 
-    // PMR: 2MB 池. 注意: MSVC main 线程默认栈只 1MB, 直接栈分配 2MB 会立刻爆栈崩溃
-    // (不像 gui.cpp 的 worker 线程可以用 CreateThread 显式指定大栈).
-    // 主线程方案:
-    //   1) 改用 unique_ptr<array> 堆分配 — 一次性 malloc, 0 碎片, monotonic 池仍然 O(1) 分配
-    //   2) 或链接时加 /STACK:4194304
-    // 这里选 1 (不需要修改链接选项, 单文件可移植).
-    constexpr size_t kBufSize = 2 * 1024 * 1024;
-    auto stackBuffer = std::make_unique<std::array<std::byte, kBufSize>>();
-    std::pmr::monotonic_buffer_resource pool(stackBuffer->data(), stackBuffer->size());
+    // PMR: 栈上 2MB 池 (与终末地 main.cpp 同款).
+    // 注意: MSVC main 线程默认栈只 1MB, 直接放 2MB 会爆栈崩溃。
+    // 必须在链接器加 /STACK:4194304 (4MB) 才能用栈池。
+    // 栈池 vs 堆池的性能差异:
+    //   - 分配/释放开销 0 (栈指针偏移 vs malloc 一次 2MB + free)
+    //   - 与栈上的局部变量物理相邻, L1/L2 命中, TLB 不会 miss
+    //   - monotonic_buffer 整个工作集都从此池分配, 锁在热区
+    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
+    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
     std::pmr::vector<ExportRecord> records(alloc);
@@ -512,18 +508,14 @@ int main() {
                     }
                 }
             }
-            printf("\xE6\x88\x90\xE5\x8A\x9F\xE5\x8A\xA0\xE8\xBD\xBD\xE6\x9C\xAC\xE5\x9C\xB0\xE5\xAD\x98"
-                   "\xE5\x82\xA8\xE7\x9A\x84 %zu \xE6\x9D\xA1\xE6\x8A\xBD\xE5\x8D\xA1\xE8\xAE\xB0\xE5\xBD\x95\xE3\x80\x82\n",
-                   records.size());
+            printf("成功加载本地存储的 %zu 条抽卡记录。\n", records.size());
         } else {
-            printf("\xE6\x9C\xAA\xE5\x8F\x91\xE7\x8E\xB0\xE6\x9C\xAC\xE5\x9C\xB0\xE8\xAE\xB0\xE5\xBD\x95\xEF\xBC\x8C"
-                   "\xE5\xB0\x86\xE5\x88\x9B\xE5\xBB\xBA\xE6\x96\xB0\xE6\x96\x87\xE4\xBB\xB6\xE3\x80\x82\n");
+            printf("未发现本地记录，将创建新文件。\n");
         }
     }  // <- Guard 全部析构, 文件完全释放
 
     printf("\n========================================\n");
-    printf("        \xE5\xBC\x80\xE5\xA7\x8B\xE5\x90\x91\xE6\x9C\x8D\xE5\x8A\xA1\xE5\x99\xA8\xE6\x8B\x89"
-           "\xE5\x8F\x96\xE6\x8A\xBD\xE5\x8D\xA1\xE6\x95\xB0\xE6\x8D\xAE\n");
+    printf("        开始向服务器拉取抽卡数据\n");
     printf("========================================\n");
 
     WinHttpHandle hSession;
@@ -534,7 +526,7 @@ int main() {
         hConnect.h = WinHttpConnect(hSession, hostName.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
     }
     if (!hConnect.h) {
-        printf("\xE7\xBD\x91\xE7\xBB\x9C\xE5\x88\x9D\xE5\xA7\x8B\xE5\x8C\x96\xE5\xA4\xB1\xE8\xB4\xA5!\n");
+        printf("网络初始化失败!\n");
         system("pause"); return 1;
     }
 
@@ -545,7 +537,7 @@ int main() {
     std::string gameBizStr(gameBiz), regionStr(region);
 
     for (const auto& poolCfg : pools) {
-        printf("\n>>> \xE6\xAD\xA3\xE5\x9C\xA8\xE6\x8A\x93\xE5\x8F\x96 [%s] ...\n", poolCfg.displayName.c_str());
+        printf("\n>>> 正在抓取 [%s] ...\n", poolCfg.displayName.c_str());
         bool reachedExisting = false;
         std::string endIdCursor = "0";  // 米哈游 API: end_id="0" 表示从最新开始
         int page = 1, poolFetchedCount = 0;
@@ -570,20 +562,19 @@ int main() {
             std::string_view resView = networkPayloads.back();
 
             if (resView.empty()) {
-                printf("  [\xE9\x94\x99\xE8\xAF\xAF] \xE7\xBD\x91\xE7\xBB\x9C\xE8\xAF\xB7"
-                       "\xE6\xB1\x82\xE5\xA4\xB1\xE8\xB4\xA5\xE6\x88\x96 authkey \xE5\xB7\xB2\xE5\xA4\xB1\xE6\x95\x88\xE3\x80\x82\n");
+                printf("  [错误] 网络请求失败或 authkey 已失效。\n");
                 break;
             }
 
             // 米哈游统一返回 {"retcode": 0, "message": "OK", "data": {...}}
             std::string_view codeStr = ExtractJsonValue(resView, "retcode", false);
             if (codeStr.empty()) {
-                printf("  [\xE9\x94\x99\xE8\xAF\xAF] \xE6\x8E\xA5\xE5\x8F\xA3\xE8\xBF\x94\xE5\x9B\x9E\xE9\x9D\x9E JSON \xE6\x95\xB0\xE6\x8D\xAE\xE6\x88\x96\xE6\xA0\xBC\xE5\xBC\x8F\xE5\xBC\x82\xE5\xB8\xB8\xE3\x80\x82\n");
+                printf("  [错误] 接口返回非 JSON 数据或格式异常。\n");
                 break;
             }
             if (codeStr != "0") {
                 auto msgStr = ExtractJsonValue(resView, "message", true);
-                printf("  [\xE6\x8F\x90\xE7\xA4\xBA] \xE6\x8E\xA5\xE5\x8F\xA3\xE8\xBF\x94\xE5\x9B\x9E\xE4\xBF\xA1\xE6\x81\xAF: %.*s\n",
+                printf("  [提示] 接口返回信息: %.*s\n",
                        (int)msgStr.size(), msgStr.data());
                 break;
             }
@@ -603,12 +594,12 @@ int main() {
 
                 if (local_ids.contains(parsed_id)) {
                     reachedExisting = true;
-                    printf("  * \xE8\xA7\xA6\xE8\xBE\xBE\xE6\x9C\xAC\xE5\x9C\xB0\xE8\x80\x81\xE8\xAE\xB0\xE5\xBD\x95 (ID: %lld)\xEF\xBC\x8C\xE5\x81\x9C\xE6\xAD\xA2\xE8\xBF\xBD\xE6\xBA\xAF\xE3\x80\x82\n",
+                    printf("  * 触达本地老记录 (ID: %lld)，停止追溯。\n",
                            parsed_id);
                     return;
                 }
                 if (sessionIds.contains(parsed_id)) {
-                    printf("\n  [\xE8\xAD\xA6\xE5\x91\x8A] \xE9\x81\x87\xE5\x88\xB0\xE9\x87\x8D\xE5\xA4\x8D\xE6\x95\xB0\xE6\x8D\xAE (ID: %lld)\xEF\xBC\x8C\xE9\x98\xB2\xE6\xAD\xBB\xE5\xBE\xAA\xE7\x8E\xAF\xE4\xB8\xAD\xE6\xAD\xA2\xE3\x80\x82\n",
+                    printf("\n  [警告] 遇到重复数据 (ID: %lld)，防死循环中止。\n",
                            parsed_id);
                     reachedExisting = true;
                     return;
@@ -640,7 +631,7 @@ int main() {
 
                 records.push_back(std::move(rec));
                 poolFetchedCount++;
-                printf("  \xE8\x8E\xB7\xE5\x8F\x96\xE5\x88\xB0: %.*s (rank_type=%.*s)\n",
+                printf("  获取到: %.*s (rank_type=%.*s)\n",
                        (int)records.back().name.size(),     records.back().name.data(),
                        (int)records.back().rankType.size(), records.back().rankType.data());
             });
@@ -656,16 +647,13 @@ int main() {
             // 米哈游接口对单 IP 限流较严; 终末地原版 300ms, 这里 500ms 更稳妥
             Sleep(500);
         }
-        printf(">>> [%s] \xE6\x8A\x93\xE5\x8F\x96\xE5\xAE\x8C\xE6\x88\x90\xEF\xBC\x8C"
-               "\xE6\x9C\xAC\xE6\xAC\xA1\xE6\x96\xB0\xE5\xA2\x9E\xE6\x8B\x89\xE5\x8F\x96: %d \xE6\x9D\xA1\xE3\x80\x82\n",
+        printf(">>> [%s] 抓取完成，本次新增拉取: %d 条。\n",
                poolCfg.displayName.c_str(), poolFetchedCount);
         Sleep(800);  // 切池子也间隔一下
     }
 
     printf("\n========================================\n");
-    printf("\xE5\xB7\xB2\xE5\xAE\x8C\xE6\x88\x90\xE5\x85\xA8\xE9\x83\xA8\xE6\x8A\x93\xE5\x8F\x96"
-           "\xEF\xBC\x81\xE6\x80\xBB\xE8\xAE\xA1\xE8\xAE\xB0\xE5\xBD\x95\xE6\x95\xB0: %zu \xE6\x9D\xA1\xE3\x80\x82\n",
-           records.size());
+    printf("已完成全部抓取！总计记录数: %zu 条。\n", records.size());
 
     // 排序: 绝区零的 id 是 19 位全局递增 ID, 直接按 id 升序就是按时间升序.
     // 不需要终末地版本里"角色武器分区"的 trick.
@@ -789,15 +777,13 @@ int main() {
 
         if (MoveFileExA(tempFilename.c_str(), uigfFilename.c_str(),
                         MOVEFILE_REPLACE_EXISTING)) {
-            printf("\xE5\xB7\xB2\xE6\x88\x90\xE5\x8A\x9F\xE6\x9B\xB4\xE6\x96\xB0\xE8\xAE\xB0\xE5\xBD\x95\xE5\xB9\xB6\xE4\xBF\x9D\xE5\xAD\x98\xE8\x87\xB3: %s\n",
-                   uigfFilename.c_str());
+            printf("已成功更新记录并保存至: %s\n", uigfFilename.c_str());
         } else {
-            printf("\xE6\x96\x87\xE4\xBB\xB6\xE8\xA6\x86\xE7\x9B\x96\xE5\xA4\xB1\xE8\xB4\xA5\xEF\xBC\x81"
-                   "\xE8\xAF\xB7\xE6\x89\x8B\xE5\x8A\xA8\xE5\xB0\x86 %s \xE9\x87\x8D\xE5\x91\xBD\xE5\x90\x8D\xE4\xB8\xBA %s\n",
+            printf("文件覆盖失败！请手动将 %s 重命名为 %s\n",
                    tempFilename.c_str(), uigfFilename.c_str());
         }
     } else {
-        printf("\xE4\xB8\xB4\xE6\x97\xB6\xE6\x96\x87\xE4\xBB\xB6\xE5\x88\x9B\xE5\xBB\xBA\xE5\xA4\xB1\xE8\xB4\xA5\xEF\xBC\x81\n");
+        printf("临时文件创建失败！\n");
     }
 
     system("pause");
