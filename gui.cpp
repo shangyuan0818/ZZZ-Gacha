@@ -460,16 +460,31 @@ double ComputeKS(const std::array<int, 200>& freq, int max_pity, int n,
     if (n == 0) return 0.0;
     // 防御性 clamp: freq 数组容量 200, max_pity 必须 < 200 否则越界读
     if (max_pity > 199) max_pity = 199;
+    // v0.1.2.2: 找到 CDF 表的"有效末端" last_valid (饱和到 1 或单调性破坏前的最后一格).
+    // 越过 last_valid 后, 用 cdf[last_valid] 而非 1.0 作 fallback —— 避免长尾/未填充段
+    // 导致 K-S 偏离被高估. 对 ZZZ 的 CDF (全饱和到 1.0) 来说主要找到饱和点, 避免在
+    // 硬保底后的哨兵区做无意义比较.
+    constexpr double EPS_SAT = 1e-6;
+    int last_valid = cdf_len - 1;
+    for (int k = 1; k < cdf_len; ++k) {
+        if (cdf_table[k] >= 1.0 - EPS_SAT) { last_valid = k; break; }
+        if (k > 0 && cdf_table[k] + EPS_SAT < cdf_table[k - 1]) { last_valid = k - 1; break; }
+    }
+    auto lookup_cdf = [&](int idx) -> double {
+        if (idx < 0) return 0.0;
+        if (idx >= cdf_len) return cdf_table[last_valid];
+        return cdf_table[idx];
+    };
     double max_d = 0.0;
     int cum_count = 0;
     for (int x = 1; x <= max_pity; ++x) {
         double fn_before    = (double)cum_count / n;
-        double cdf_before_x = (x - 1 < cdf_len) ? cdf_table[x - 1] : 1.0;
+        double cdf_before_x = lookup_cdf(x - 1);
 
         cum_count += freq[x];
 
         double fn_after    = (double)cum_count / n;
-        double cdf_after_x = (x < cdf_len) ? cdf_table[x] : 1.0;
+        double cdf_after_x = lookup_cdf(x);
 
         double d1 = std::abs(fn_before - cdf_before_x);
         double d2 = std::abs(fn_after  - cdf_after_x);
@@ -1094,15 +1109,9 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
             if (i > max_x) max_x = i;
         }
     }
-    if (!hasData) {
-        Gdiplus::Font emptyFont(&fontFamily, DPIScaleF(14.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-        Gdiplus::SolidBrush emptyBrush(Gdiplus::Color(255, 150, 150, 150));
-        g.DrawString(L"暂无出金数据", -1, &emptyFont,  // 暂无出金数据
-                     Gdiplus::PointF((float)rect.X + (float)rect.Width / 2.0f - DPIScaleF(50.0f),
-                                     (float)rect.Y + (float)rect.Height / 2.0f),
-                     &emptyBrush);
-        return;
-    }
+    // v0.1.2.1: 无出金时不再直接 return, 而是继续渲染坐标轴和理论 CDF (蓝/红虚线),
+    // 让用户能看到"这个池子的理论分布长什么样"的参考曲线.
+    // 经验 ECDF 阶梯线和 KS 标记本身有 total==0 守卫, 会自然跳过.
     max_x = ((max_x / 10) + 1) * 10;
 
     Gdiplus::Pen gridPen(Gdiplus::Color(255, 230, 230, 230), DPIScaleF(1.0f));
@@ -1168,13 +1177,24 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         pen.SetLineJoin(Gdiplus::LineJoinRound);
         int upper = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
         if (upper < 1) return;
+        // v0.1.2.2: 截掉两类"伪末端":
+        //   1) 已饱和段: cdf[k] >= 1-eps, 之后全等于 1.0 (硬保底后的哨兵区),
+        //      画到饱和点就停, 否则末端会冒出一段无意义的水平虚线.
+        //   2) 未填充哨兵段: cdf[k] < cdf[k-1] (单调性破坏), 立即截断.
+        constexpr double EPS_SAT = 1e-6;
+        int upper_eff = upper;
+        for (int k = 1; k <= upper; ++k) {
+            if (cdf[k] >= 1.0 - EPS_SAT) { upper_eff = k; break; }
+            if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
+        }
+        if (upper_eff < 1) return;
         Gdiplus::GraphicsPath path;
         auto p0 = getPt(0, cdf[0]);
         Gdiplus::PointF prev = p0;
         constexpr double JUMP_THRESHOLD = 5.0;
         constexpr double MIN_PREV_DELTA = 1e-6;
         bool inStepMode = false;
-        for (int k = 1; k <= upper; ++k) {
+        for (int k = 1; k <= upper_eff; ++k) {
             double curDelta  = cdf[k] - cdf[k-1];
             double prevDelta = (k >= 2) ? cdf[k-1] - cdf[k-2] : 0.0;
             bool drawAsStep;
@@ -1252,9 +1272,20 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                             BYTE r, BYTE gC, BYTE b,
                             KSLabelAnchor anchor) {
         if (total == 0 || !cdf || cdf_len < 2) return;
+        // v0.1.2.2/4: 同 drawTheoryCDF / computeTheoryMRL, 加 upper_eff 截断避免:
+        //   - 未填充哨兵段被误判为最大偏离点 (|cum - 0| ≈ 1)
+        //   - 饱和段 (cdf[k]==1 after hard pity) 上做无意义的比较
+        constexpr double EPS_SAT = 1e-6;
+        int upper_scan = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
+        int upper_eff = upper_scan;
+        for (int k = 1; k <= upper_scan; ++k) {
+            if (cdf[k] >= 1.0 - EPS_SAT) { upper_eff = k; break; }
+            if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
+        }
+        if (upper_eff < 1) return;
         double max_d = 0; int max_d_x = 0;
         double cum = 0;
-        for (int k = 1; k <= max_x && k < cdf_len; ++k) {
+        for (int k = 1; k <= upper_eff; ++k) {
             cum += (double)freq[k] / (double)total;
             double d = std::fabs(cum - cdf[k]);
             if (d > max_d) { max_d = d; max_d_x = k; }
@@ -1356,6 +1387,19 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                     swatchW, DPIScaleF(3.0f));
     g.DrawString(legAll, -1, &legendFont,
                  Gdiplus::PointF(xAllText, legendY), &textBrush);
+
+    // 无出金时, 在绘图区中央叠加灰色提示 (v0.1.2.1, 理论曲线仍可见)
+    if (!hasData) {
+        Gdiplus::Font hintFont(&fontFamily, DPIScaleF(13.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush hintBrush(Gdiplus::Color(200, 130, 130, 130));
+        const wchar_t* hint = L"暂无出金数据 (仅显示理论曲线参考)";
+        Gdiplus::RectF box;
+        g.MeasureString(hint, -1, &hintFont, Gdiplus::PointF(0, 0), &box);
+        g.DrawString(hint, -1, &hintFont,
+                     Gdiplus::PointF(plotX + plotW * 0.5f - box.Width * 0.5f,
+                                     plotY + plotH * 0.5f - box.Height * 0.5f),
+                     &hintBrush);
+    }
 }
 
 // ---------------------------------------------------------
@@ -1397,15 +1441,8 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     for (int i = 1; i < 200; i++) {
         if (freq_all[i] > 0 || freq_up[i] > 0) if (i > max_x) max_x = i;
     }
-    if (!hasData) {
-        Gdiplus::Font emptyFont(&fontFamily, DPIScaleF(14.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-        Gdiplus::SolidBrush emptyBrush(Gdiplus::Color(255, 150, 150, 150));
-        g.DrawString(L"暂无出金数据", -1, &emptyFont,
-                     Gdiplus::PointF((float)rect.X + (float)rect.Width / 2.0f - DPIScaleF(50.0f),
-                                     (float)rect.Y + (float)rect.Height / 2.0f),
-                     &emptyBrush);
-        return;
-    }
+    // v0.1.2.1: 无出金时不直接 return, 继续渲染坐标轴 + 理论 MRL 虚线,
+    // 末尾叠加灰色提示. 经验 MRL 线本身有 surv==0 守卫, 会自然跳过.
     max_x = ((max_x / 10) + 1) * 10;
 
     // ---- 计算经验 MRL 序列 (并记录每个 t 处的 surviving 计数) ----
@@ -1436,11 +1473,21 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         std::array<double, 200> tmrl{}; tmrl.fill(-1.0);
         if (!cdf || cdf_len < 2) return tmrl;
         int upper = cdf_len - 1;
-        for (int t = 0; t <= upper - 1 && t <= max_x; ++t) {
+        // v0.1.2.2: 与 drawTheoryCDF 同样的 upper_eff 截断逻辑, 避免:
+        //   1) 饱和段 (cdf[k]==1 after hard pity): 不必再算
+        //   2) 未填充末端: 算 pdf[k]=cdf[k]-cdf[k-1] 会出异常值
+        constexpr double EPS_SAT = 1e-6;
+        int upper_eff = upper;
+        for (int k = 1; k <= upper; ++k) {
+            if (cdf[k] >= 1.0 - EPS_SAT) { upper_eff = k; break; }
+            if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
+        }
+        if (upper_eff < 1) return tmrl;
+        for (int t = 0; t <= upper_eff - 1 && t <= max_x; ++t) {
             double surv_t = 1.0 - cdf[t];
             if (surv_t < 1e-9) break;
             double num = 0.0;
-            for (int k = t + 1; k <= upper; ++k) {
+            for (int k = t + 1; k <= upper_eff; ++k) {
                 double pdf_k = cdf[k] - cdf[k-1];
                 num += (double)(k - t) * pdf_k;
             }
@@ -1707,6 +1754,19 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                     swatchW, DPIScaleF(3.0f));
     g.DrawString(legAll, -1, &legendFont,
                  Gdiplus::PointF(xAllText, legendY), &textBrush);
+
+    // 无出金时, 在绘图区中央叠加灰色提示 (v0.1.2.1, 理论曲线仍可见)
+    if (!hasData) {
+        Gdiplus::Font hintFont(&fontFamily, DPIScaleF(13.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush hintBrush(Gdiplus::Color(200, 130, 130, 130));
+        const wchar_t* hint = L"暂无出金数据 (仅显示理论曲线参考)";
+        Gdiplus::RectF box;
+        g.MeasureString(hint, -1, &hintFont, Gdiplus::PointF(0, 0), &box);
+        g.DrawString(hint, -1, &hintFont,
+                     Gdiplus::PointF(plotX + plotW * 0.5f - box.Width * 0.5f,
+                                     plotY + plotH * 0.5f - box.Height * 0.5f),
+                     &hintBrush);
+    }
 }
 
 void RebuildChartCache(HWND hwnd) {

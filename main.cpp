@@ -50,6 +50,7 @@
 // API 返回的 item_type 在 zh-cn 下就是中文名, 直接精确匹配
 enum class ItemType : uint8_t { Unknown = 0, Agent, WEngine, Bangboo };
 
+// 无堆分配的大小写不敏感 find —— 原版每次都 std::string 拷贝, 这是 hot-path bug
 inline bool ContainsCI(std::string_view haystack, std::string_view needle) {
     if (needle.empty() || haystack.size() < needle.size()) return false;
     const size_t H = haystack.size();
@@ -118,6 +119,7 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
         ++pos;
         size_t endPos = pos;
         while (endPos < source.length() && source[endPos] != '"') {
+            // 修复: \\ 处理必须是"跳 2 字节", 原版 source[endPos]='\\' 后只 endPos++ 一次, 边界上会越界
             if (source[endPos] == '\\' && endPos + 1 < source.length()) endPos += 2;
             else ++endPos;
         }
@@ -530,6 +532,7 @@ int main() {
         system("pause"); return 1;
     }
 
+    // sessionIds 用 unordered_set (O(1) 去重)
     std::pmr::unordered_set<long long> sessionIds(alloc);
     sessionIds.reserve(5000);
 
@@ -783,7 +786,7 @@ int main() {
                    tempFilename.c_str(), uigfFilename.c_str());
         }
     } else {
-        printf("临时文件创建失败！\n");
+        printf("临时文件创建失败！请检查目录权限。\n");
     }
 
     system("pause");
