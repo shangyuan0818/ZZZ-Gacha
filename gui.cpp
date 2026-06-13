@@ -1,21 +1,13 @@
 // ============================================================
 // ZZZ Gacha Visualizer - Win32 + GDI+ + PMR / 预分桶 / AoS
-// ============================================================
-// 绝区零(Zenless Zone Zero)抽卡记录可视化分析工具
-//
-// 与终末地版本的关键差异:
-//   1. UIGF 顶层 key: "nap" (官方支持) 而非自定义 "endfield"
-//   2. UIGF 字段名: "name" 而非 "item_name"; 多了 "count"/"gacha_id"
-//   3. gacha_type 是数字字符串 ("1"/"2"/"3"/"5"), 不是枚举字符串
-//   4. 物品稀有度: rank_type 字符串, "2"=B级, "3"=A级, "4"=S级
-//      (注: ZZZ rank_type 是 2/3/4, 不是 3/4/5/6)
-//   5. 概率模型完全不同 (米哈游模型, 见 InitCDFTables)
-//   6. 没有 30 抽赠送十连, 没有 60 抽返利, 不需要 is_free 字段
-//   7. 池子分类: 代理人 UP 池("2") + 音擎 UP 池("3") 是分析对象
-//      常驻池("1") 和邦布池("5") 可以读但不分析
-//   8. 50/50 vs 75/25: 代理人池歪率 50%, 音擎池歪率 25%
-//
-// 编译: cl /std:c++20 /EHsc /O2 gui.cpp /link /STACK:4194304
+// ------------------------------------------------------------
+// 自 Endfield Gacha Visualizer (v0.1.3.3 加固版) 迁移到绝区零:
+//   三个分析池: 独家频段(代理人 UP, "2") / 音擎频段(武器 UP, "3") /
+//               常驻频段(热门卡司, "1"); 邦布频段("5") 不分析。
+//   保底模型: 代理人/常驻 0.6%/74软/90硬, 音擎 1.0%/65软/80硬;
+//   UP 大保底真实存在 ("歪了下次必中"), 水位与大保底状态跨期【永续】
+//   (区别于终末地的每期重置) → 无卡池边界探测, 无 pool_map, 无 is_free。
+//   数组容量 200: 代理人 UP 大保底间隔上限 180 (90 歪 + 90 保底) + 富余。
 // ============================================================
 #include <windows.h>
 #include <commctrl.h>
@@ -36,68 +28,31 @@
 #include <ranges>
 #include <memory_resource>
 #include <array>
+#include <span>           // v0.1.3.3: 理论 CDF 表改用 std::span 传参
 #include <cstdint>
+#include <memory>      // std::make_unique_for_overwrite (C++20) —— worker 的 2MB PMR arena 用它在堆上不清零分配
+#include <process.h>   // _beginthreadex / _endthreadex(调用 CRT 的线程应走这个而非裸 CreateThread)
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
-// MSVC 不会自动链接 Win32 GUI 基础库 (在 /MT 或某些工具链版本下), 必须显式声明.
-// 如果忘加, 会出现一大堆 LNK2019 (BitBlt/GetMessageW/DragQueryFileW 等无法解析).
-#pragma comment(lib, "gdi32.lib")     // BitBlt / GDI 绘图
-#pragma comment(lib, "user32.lib")    // 窗口 / 消息 / 控件 / GetMessage 等
-#pragma comment(lib, "shell32.lib")   // DragQueryFile / DragAcceptFiles
-#pragma comment(lib, "ole32.lib")     // GdiplusStartup 间接依赖 (COM)
-#pragma comment(lib, "Msimg32.lib")   // (保险) AlphaBlend 等
 
 // ---------------------------------------------------------
 // [枚举降维]
+// 注: 分析核心不消费 item_type 字段 —— 分桶按 gacha_type, 稀有度按
+// rank_type, UP 判定按 name (item_type 仅存在于拉取/导出链路 main_zzz.cpp)。
 // ---------------------------------------------------------
-// 绝区零物品类型: 代理人/音擎/邦布 (角色/武器/宠物)
-enum class ItemType  : uint8_t { Unknown = 0, Agent, WEngine, Bangboo };
-
-// 稀有度: ZZZ 用 2/3/4 表示 B/A/S (不是终末地的 3/4/5/6)
+// 稀有度: 2=B, 3=A, 4=S
 enum class RankType  : uint8_t { Unknown = 0, RankB = 2, RankA = 3, RankS = 4 };
-
-// gacha_type 数字字符串映射: "1"/"2"/"3"/"5"
+// gacha_type 数字字符串: "1"/"2"/"3"/"5" (UIGF v4.2 nap.gacha_type enum)
 enum class GachaType : uint8_t {
-    Unknown = 0,
-    Standard = 1,    // "1" 常驻频段(热门卡司)
-    AgentUP = 2,     // "2" 独家频段(代理人 UP)
-    WEngineUP = 3,   // "3" 音擎频段(武器 UP)
-    Bangboo = 5      // "5" 邦布频段
+    Unknown   = 0,
+    Standard  = 1,   // "1" 常驻频段(热门卡司) — 分析对象 (仅综合, 无 UP)
+    AgentUP   = 2,   // "2" 独家频段(代理人 UP) — 分析对象
+    WEngineUP = 3,   // "3" 音擎频段(武器 UP)   — 分析对象
+    Bangboo   = 5    // "5" 邦布频段 — 不分析
 };
 
-// 无堆分配的大小写不敏感包含比较
-inline bool ContainsCI(std::string_view haystack, std::string_view needle) {
-    if (needle.empty() || haystack.size() < needle.size()) return false;
-    const size_t H = haystack.size();
-    const size_t N = needle.size();
-    for (size_t i = 0; i + N <= H; ++i) {
-        bool ok = true;
-        for (size_t j = 0; j < N; ++j) {
-            char a = haystack[i + j];
-            char b = needle[j];
-            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
-            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
-            if (a != b) { ok = false; break; }
-        }
-        if (ok) return true;
-    }
-    return false;
-}
-
-inline ItemType ParseItemType(std::string_view sv) {
-    // zh-cn: API 直接返回中文 "代理人"/"音擎"/"邦布"
-    if (sv == "代理人") return ItemType::Agent;     // 代理人
-    if (sv == "音擎")             return ItemType::WEngine;   // 音擎
-    if (sv == "邦布")             return ItemType::Bangboo;   // 邦布
-    if (ContainsCI(sv, "agent"))   return ItemType::Agent;
-    if (ContainsCI(sv, "engine"))  return ItemType::WEngine;
-    if (ContainsCI(sv, "bangboo")) return ItemType::Bangboo;
-    return ItemType::Unknown;
-}
-
 inline RankType ParseRankType(std::string_view sv) {
-    // ZZZ: 4=S, 3=A, 2=B (注意比终末地少一档)
     if (sv == "4") return RankType::RankS;
     if (sv == "3") return RankType::RankA;
     if (sv == "2") return RankType::RankB;
@@ -105,7 +60,8 @@ inline RankType ParseRankType(std::string_view sv) {
 }
 
 inline GachaType ParseGachaType(std::string_view sv) {
-    // 数字字符串直接对应; 严格相等避免误匹配 "12" 这种(虽然 API 不返回)
+    // ZZZ 的 gacha_type 是数字字符串, 严格相等匹配即可;
+    // 不做 Contains 匹配以免 "12" 之类的值误配 (API 实际不返回这种值, 纯防御)
     if (sv == "1") return GachaType::Standard;
     if (sv == "2") return GachaType::AgentUP;
     if (sv == "3") return GachaType::WEngineUP;
@@ -148,6 +104,7 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
         return (endPos < source.length()) ? source.substr(pos, endPos - pos) : std::string_view{};
     } else {
         size_t endPos = pos;
+        // 注意:原版 gui.cpp 少了 ']' 判断(main.cpp 有),这里补齐以保证解析嵌套数组值时不出错
         while (endPos < source.length() &&
                source[endPos] != ',' && source[endPos] != '}' &&
                source[endPos] != ']' && source[endPos] != ' ' &&
@@ -202,32 +159,15 @@ inline std::string WideToUtf8(std::wstring_view wstr) {
     return result;
 }
 
-// 注意: UP 列表用 ASCII ',' 作分隔符; 不识别全角逗号 '，'(U+FF0C)。
-// 这是有意为之 —— 合法的角色名 / 物品名本身可能含全角符号(绝区零里「11号」
-// 用了全角引号「」, 未来也可能出现含全角逗号的名字), 把全角逗号当分隔符
-// 会导致这些条目被切碎、UP 识别失效。用户输入法切换的便利不值这个代价。
-// (与终末地版本同步设计, 该版本下注释已论证过这一选择)
-std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparatedUtf8(const std::wstring& text) {
-    std::unordered_set<std::string, StringHash, std::equal_to<>> result;
-    std::wstring cur;
-    for (wchar_t c : text) {
-        if (c == L',') {
-            cur.erase(0, cur.find_first_not_of(L" \t\r\n"));
-            if (!cur.empty()) cur.erase(cur.find_last_not_of(L" \t\r\n") + 1);
-            if (!cur.empty()) result.insert(WideToUtf8(cur));
-            cur.clear();
-        } else cur += c;
-    }
-    cur.erase(0, cur.find_first_not_of(L" \t\r\n"));
-    if (!cur.empty()) cur.erase(cur.find_last_not_of(L" \t\r\n") + 1);
-    if (!cur.empty()) result.insert(WideToUtf8(cur));
-    return result;
-}
-
-// 上面 ParseCommaSeparatedUtf8 依赖 WideToUtf8 → 仅在主线程安全使用
-// (WideCharToMultiByte 本身 thread-safe, 但 GetWindowText 必须主线程,
-//  所以是分两步: 主线程提取 wstring + 转 utf8, 然后下面这个 FromUtf8 版
-//  在 worker 上跑)。下面是 utf8 直进版本:
+// 注意:常驻名单文本中故意只识别 ASCII ',' 作为分隔符。
+// 全角逗号 '，'(U+FF0C) 不视为分隔符 —— 因为合法的物品名本身可能含全角符号
+// (ZZZ 里「11号」用了全角直角引号「」, 未来也可能出现含全角逗号的名字)。
+// 把全角逗号当分隔符会导致这些条目被切碎, UP 识别失效。
+//
+// ZZZ 的 UP 判定是二元化的: "S 级不在常驻名单 = 当期 UP", 不需要终末地那种
+// "池名→UP角色" 映射 (ParsePoolMapUtf8* 已随之移除); 宽字符版
+// ParseCommaSeparatedUtf8 在 Endfield 版中已是死代码 (主线程只做
+// GetWindowText→WideToUtf8, 解析统一在 worker 用 FromUtf8 版), 一并移除。
 inline std::string TrimUtf8(std::string_view sv) {
     size_t b = sv.find_first_not_of(" \t\r\n");
     if (b == std::string_view::npos) return {};
@@ -236,8 +176,7 @@ inline std::string TrimUtf8(std::string_view sv) {
 }
 
 std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparatedUtf8FromUtf8(std::string_view text) {
-    // 与 wchar_t 版同步: 仅识别 ASCII ',' 作为分隔符, 不识别全角逗号。
-    // 理由见上方 ParseCommaSeparatedUtf8 的注释。
+    // 与 wchar_t 版同步: 仅识别 ASCII ',' 作为分隔符,不识别全角逗号。
     std::unordered_set<std::string, StringHash, std::equal_to<>> result;
     std::string cur;
     for (size_t i = 0; i < text.size(); ++i) {
@@ -255,11 +194,11 @@ std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparated
 }
 
 // ---------------------------------------------------------
-// [SoA 分桶]
-// 绝区零简化: 没有 is_free, 不需要 poolNames 映射 (因为绝区零不会"歪到任意非UP"
-// —— 歪了一定是常驻S, 而常驻S列表是固定的, 直接用 standard_names 集合判定就够了.
-// 第三个参数 pool_map 在终末地用来"按池子名找对应UP"; 绝区零的 UP 角色由用户在
-// GUI 输入框里指定, 用 up_names 集合统一判定即可.)
+// [SoA 分桶 - 独家/音擎/常驻 独立桶,Calculate 不再 filter 全量]
+// 统计热路径 (非 S 级的 [[likely]] 分支) 只访问紧凑的 rank_types 标量数组;
+// names 仅在少量 S 级记录做 UP 判定时才访问 (会触达 mmap 字节)。
+// ZZZ 不存在终末地的 poolNames(期边界重置)/is_free(赠送十连)/starts_new_banner:
+// 水位与大保底状态跨期永续, 全部记录按 id 升序连续推进。
 // ---------------------------------------------------------
 struct PullBucket {
     std::pmr::vector<RankType>         rank_types;
@@ -277,17 +216,19 @@ struct PullBucket {
     size_t size() const { return rank_types.size(); }
 };
 
-// alignas(128) 而非 64: Apple Silicon 与 Intel Sandy Bridge+ 上 spatial prefetcher
-// 会预取相邻 cacheline (128B), 用 128 对齐避免 false sharing 更稳妥
-struct alignas(128) StatsAccumulator {
-    std::array<int, 200> freq_all{};   // ZZZ UP 上限可达 180 (大保底), 给 200 留富余
+// StatsAccumulator: Calculate() 内的单线程累加器 (局部变量 acc), 不存在多核并发写,
+// 不需要 cache-line 对齐 —— 故不加 alignas (旧版的 alignas(128) 在单线程下是无操作,
+// 留着只会误导维护者以为这里有并发)。将来若改成多线程分片归约、每线程持有相邻
+// accumulator, 再按实际 cache-line 布局补 padding 防 false sharing 即可。
+struct StatsAccumulator {
+    std::array<int, 200> freq_all{};   // 容量 200: 代理人 UP 间隔上限 180 + 富余
     std::array<int, 200> freq_up{};
     long long sum_all = 0, sum_sq_all = 0, sum_up = 0, sum_sq_up = 0, sum_win = 0;
     int count_all = 0, count_up = 0, count_win = 0;
     int max_pity_all = 0, max_pity_up = 0;
     int win_5050 = 0, lose_5050 = 0;
-    // 右删失: 循环结束时仍在累积、尚未结算的当前保底计数
-    // 生存分析里这些样本应参与分母 (risk set), 但不参与分子 (event)
+    // 右删失:循环结束时仍在累积、尚未结算的当前保底计数
+    // 生存分析里这些样本应参与分母(risk set),但不参与分子(event)
     int censored_pity_all = 0;
     int censored_pity_up  = 0;
 };
@@ -303,13 +244,12 @@ struct StatsResult {
     std::array<double, 200> hazard_all{}, hazard_up{};
     double ks_d_all = 0.0, ks_d_up = 0.0;
     bool ks_is_normal = true, ks_is_normal_up = true;
-    // 右删失 (用于显示"当前已垫 N 抽")
+    // 右删失(用于显示"当前已垫 N 抽")
     int censored_pity_all = 0;
     int censored_pity_up  = 0;
 };
 
-// 全局统计结果: 代理人池 / 音擎池
-StatsResult statsAgent, statsWEngine;
+StatsResult statsAgent, statsWEngine, statsStandard;
 HWND hOutEdit, hAgentEdit, hWEngineEdit;
 static HBITMAP g_hChartBmp = NULL;
 int g_dpi = 96;
@@ -319,7 +259,9 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 // -------------------------------------------------------
 // CDF 表 & KS 检验
 // -------------------------------------------------------
-// 绝区零代理人池(独家频段):
+// 米哈游模型 (官方概率公示 + 社区实测软保底拐点):
+//
+// 代理人池(独家频段) / 常驻频段(热门卡司) — 同一 S 级出货分布:
 //   基础概率 0.6%, 90 抽硬保底, 综合概率 1.6%
 //   软保底拐点: 第74抽起, 每抽 +6%
 //     k=1..73:  hazard = 0.006
@@ -327,7 +269,7 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 //     k=90:     hazard = 1.0 (硬保底)
 //   验证: 综合期望 ≈ 62.30 抽, 综合概率 = 1/62.30 ≈ 1.605% ✓
 //
-// 绝区零音擎池(音擎频段):
+// 音擎池(音擎频段):
 //   基础概率 1.0%, 80 抽硬保底, 综合概率 2.0%
 //   软保底拐点: 第65抽起, 每抽 +7%
 //     k=1..64:  hazard = 0.01
@@ -335,38 +277,40 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 //     k=80:     hazard = 1.0 (硬保底)
 //   验证: 综合期望 ≈ 49.71 抽, 综合概率 = 1/49.71 ≈ 2.012% ✓
 //
-// UP CDF: 双状态前向迭代 (与终末地相同结构, 但参数不同):
-//   代理人: 50% 不歪, 90 硬保底, UP 大保底上限 180
-//   音擎:   75% 不歪, 80 硬保底, UP 大保底上限 160
-//
-// 绝区零无"30 抽赠送十连", 无"60 抽返利", 模型比终末地干净.
-static double g_cdf_agent[92]      = {};   // x=0..90,   代理人池综合
-static double g_cdf_wengine[82]    = {};   // x=0..80,   音擎池综合
-static double g_cdf_agent_up[182]  = {};   // x=0..180,  代理人池 UP
-static double g_cdf_wengine_up[162]= {};   // x=0..160,  音擎池 UP
-static bool   g_cdf_init           = false;
+// UP CDF: 双状态前向迭代 (Dn 没歪 / Dl 已歪):
+//   "歪了下次必中"的大保底真实存在 (区别于终末地), 且状态跨期永续。
+//   转移: 没歪状态出货 → winRate 毕业, (1-winRate) 转入 Dl[0];
+//         已歪状态出货 → 100% 毕业 (大保底)。
+//   代理人: 50% 不歪, 间隔上限 180 (89 垫 + 1 歪 + 89 垫 + 1 保底), E[首UP] ≈ 93.45
+//   音擎:   75% 不歪, 间隔上限 160, E[首UP] ≈ 62.13
+// 常驻频段没有 UP, 综合 K-S 对照复用 g_cdf_agent (同分布)。
+static double g_cdf_agent[92]       = {};  // x=0..90,  代理人/常驻池综合 (末位哨兵 91)
+static double g_cdf_wengine[82]     = {};  // x=0..80,  音擎池综合
+static double g_cdf_agent_up[182]   = {};  // x=0..180, 代理人池 UP
+static double g_cdf_wengine_up[162] = {};  // x=0..160, 音擎池 UP
+static bool   g_cdf_init = false;
+
+static double HazardAgent(int k) {
+    if (k <= 73)      return 0.006;
+    else if (k <= 89) return (std::min)(1.0, 0.006 + (k - 73) * 0.06);
+    else              return 1.0;
+}
+static double HazardWEngine(int k) {
+    if (k <= 64)      return 0.01;
+    else if (k <= 79) return (std::min)(1.0, 0.01 + (k - 64) * 0.07);
+    else              return 1.0;
+}
 
 void InitCDFTables() {
-    // 幂等保护: 多次调用只填充一次
-    // 注意: 为了避免另一线程读到"半初始化"的表, init 标记必须在末尾才置 true
+    // 幂等保护: 仅 WinMain 启动时 (任何 worker 创建之前) 单线程调用一次,
+    // bool 标志即可, 不需要 call_once
     if (g_cdf_init) return;
 
-    auto h_agent = [](int k) -> double {
-        if (k <= 73)      return 0.006;
-        else if (k <= 89) return (std::min)(1.0, 0.006 + (k - 73) * 0.06);
-        else              return 1.0;
-    };
-    auto h_wengine = [](int k) -> double {
-        if (k <= 64)      return 0.01;
-        else if (k <= 79) return (std::min)(1.0, 0.01 + (k - 64) * 0.07);
-        else              return 1.0;
-    };
-
-    // ---- 代理人池综合 CDF ----
+    // ---- 代理人/常驻池综合 CDF ----
     {
         double surv = 1.0;
         for (int i = 1; i <= 90; ++i) {
-            double p = h_agent(i);
+            double p = HazardAgent(i);
             g_cdf_agent[i] = g_cdf_agent[i - 1] + surv * p;
             surv *= (1.0 - p);
         }
@@ -377,93 +321,64 @@ void InitCDFTables() {
     {
         double surv = 1.0;
         for (int i = 1; i <= 80; ++i) {
-            double p = h_wengine(i);
+            double p = HazardWEngine(i);
             g_cdf_wengine[i] = g_cdf_wengine[i - 1] + surv * p;
             surv *= (1.0 - p);
         }
         g_cdf_wengine[81] = 1.0;
     }
 
-    // ---- 代理人池 UP CDF (双状态前向迭代, 50/50, 上限 180) ----
-    // 状态空间: D_no_lost[s] (没歪过, 水位 s) + D_lost[s] (已歪, 水位 s)
-    // 转移: 没歪状态出货 50% 毕业, 50% 转入 D_lost[0]
-    //       已歪状态出货 100% 毕业 (大保底)
-    {
-        constexpr int hard_cap = 90;
-        constexpr int full_cap = 180;
-        std::array<double, hard_cap + 1> Dn{}; Dn[0] = 1.0;
-        std::array<double, hard_cap + 1> Dl{};
+    // ---- UP CDF 双状态前向迭代 (代理人 50/50 上限 180; 音擎 75/25 上限 160) ----
+    // 状态空间: Dn[s] (没歪过, 水位 s) + Dl[s] (已歪, 水位 s)
+    auto buildUp = [](double* cdf, int hard_cap, int full_cap, double win_rate,
+                      double (*hazard)(int)) {
+        std::vector<double> Dn(hard_cap + 1, 0.0); Dn[0] = 1.0;
+        std::vector<double> Dl(hard_cap + 1, 0.0);
         double cum = 0.0;
         for (int n = 1; n <= full_cap; ++n) {
-            std::array<double, hard_cap + 1> newDn{}, newDl{};
-            for (int s = 0; s < hard_cap; ++s) {
-                double h = h_agent(s + 1);
-                if (Dn[s] > 0) {
-                    double hit = Dn[s] * h;
-                    cum += hit * 0.5;                        // 50% 毕业
-                    newDl[0] += hit * 0.5;                   // 50% 歪 -> 已歪状态, 水位 0
-                    newDn[s + 1] += Dn[s] * (1.0 - h);       // 不命中, 水位 +1
+            std::vector<double> newDn(hard_cap + 1, 0.0), newDl(hard_cap + 1, 0.0);
+            for (int sidx = 0; sidx < hard_cap; ++sidx) {
+                double h = hazard(sidx + 1);
+                if (Dn[sidx] > 0) {
+                    double hit = Dn[sidx] * h;
+                    cum += hit * win_rate;                    // 不歪, 毕业
+                    newDl[0] += hit * (1.0 - win_rate);       // 歪 → 已歪状态, 水位归 0
+                    newDn[sidx + 1] += Dn[sidx] * (1.0 - h);  // 不出货, 水位 +1
                 }
-                if (Dl[s] > 0) {
-                    double hit = Dl[s] * h;
-                    cum += hit;                              // 100% 毕业
-                    newDl[s + 1] += Dl[s] * (1.0 - h);       // 不命中
-                }
-            }
-            g_cdf_agent_up[n] = (std::min)(1.0, cum);
-            Dn = newDn; Dl = newDl;
-        }
-        g_cdf_agent_up[full_cap + 1] = 1.0;
-    }
-
-    // ---- 音擎池 UP CDF (75/25, 上限 160) ----
-    {
-        constexpr int hard_cap = 80;
-        constexpr int full_cap = 160;
-        std::array<double, hard_cap + 1> Dn{}; Dn[0] = 1.0;
-        std::array<double, hard_cap + 1> Dl{};
-        double cum = 0.0;
-        for (int n = 1; n <= full_cap; ++n) {
-            std::array<double, hard_cap + 1> newDn{}, newDl{};
-            for (int s = 0; s < hard_cap; ++s) {
-                double h = h_wengine(s + 1);
-                if (Dn[s] > 0) {
-                    double hit = Dn[s] * h;
-                    cum += hit * 0.75;                       // 75% 毕业
-                    newDl[0] += hit * 0.25;                  // 25% 歪
-                    newDn[s + 1] += Dn[s] * (1.0 - h);
-                }
-                if (Dl[s] > 0) {
-                    double hit = Dl[s] * h;
-                    cum += hit;
-                    newDl[s + 1] += Dl[s] * (1.0 - h);
+                if (Dl[sidx] > 0) {
+                    double hit = Dl[sidx] * h;
+                    cum += hit;                               // 大保底, 必毕业
+                    newDl[sidx + 1] += Dl[sidx] * (1.0 - h);
                 }
             }
-            g_cdf_wengine_up[n] = (std::min)(1.0, cum);
-            Dn = newDn; Dl = newDl;
+            cdf[n] = (std::min)(1.0, cum);
+            Dn = std::move(newDn); Dl = std::move(newDl);
         }
-        g_cdf_wengine_up[full_cap + 1] = 1.0;
-    }
+        cdf[full_cap + 1] = 1.0;   // 哨兵
+    };
+    buildUp(g_cdf_agent_up,   90, 180, 0.50, &HazardAgent);
+    buildUp(g_cdf_wengine_up, 80, 160, 0.75, &HazardWEngine);
 
-    g_cdf_init = true;  // 末尾置位, 确保所有读者看到完整表
+    g_cdf_init = true;  // 末尾置位,确保所有读者看到完整表
 }
 
-// 离散阶梯 CDF 的 K-S 统计量 (与终末地相同实现)
-//
-// 关键: 经验阶梯和理论阶梯都是不连续的, KS 统计量必须严格对齐两条阶梯。
-// 在 x 处, 两条阶梯的"底": F_n(cum before x), F_theory(x-1)
-// 在 x 处, 两条阶梯的"顶": F_n(cum after x),  F_theory(x)
-// 老式实现常拿"经验阶梯底"对"理论阶梯顶", 在软保底区间 hazard 单点跳跃
-// 5%+ 的位置会人为引入巨大伪偏差 —— 必须底对底、顶对顶分别测量。
+// 修复:离散阶梯 CDF 的 K-S 统计量需严格对齐两条阶梯// 修复:离散阶梯 CDF 的 K-S 统计量需严格对齐两条阶梯
+// 在 x 处,两条阶梯的"底":F_n(cum before x),F_theory(x-1)
+// 在 x 处,两条阶梯的"顶":F_n(cum after x),F_theory(x)
+// 原版用 fn_before 减 cdf_table[x] —— 拿经验阶梯底对理论阶梯顶,
+// 人为引入 h_x 的单点跳跃(软保底段可高达 5%+),造成巨大伪偏差
 double ComputeKS(const std::array<int, 200>& freq, int max_pity, int n,
-                 const double* cdf_table, int cdf_len) {
+                 std::span<const double> cdf_table) {
+    // v0.1.3.3: "裸指针 + 长度"两个散参 → std::span (C++20)。长度随表走,
+    // 调用方不可能再把表和长度传错配对; 函数体保留局部 cdf_len, 下方逻辑零改动。
+    const int cdf_len = (int)cdf_table.size();
     if (n == 0) return 0.0;
-    // 防御性 clamp: freq 数组容量 200, max_pity 必须 < 200 否则越界读
+    // 防御性 clamp: freq 数组容量 200,max_pity 必须 < 200 否则越界读
     if (max_pity > 199) max_pity = 199;
-    // v0.1.2.2: 找到 CDF 表的"有效末端" last_valid (饱和到 1 或单调性破坏前的最后一格).
-    // 越过 last_valid 后, 用 cdf[last_valid] 而非 1.0 作 fallback —— 避免长尾/未填充段
-    // 导致 K-S 偏离被高估. 对 ZZZ 的 CDF (全饱和到 1.0) 来说主要找到饱和点, 避免在
-    // 硬保底后的哨兵区做无意义比较.
+    // 找到 CDF 表的"有效末端" last_valid (饱和到 1 或单调性破坏前的最后一格).
+    // 越过 last_valid 后, 用 cdf[last_valid] 而非 1.0 作 fallback。ZZZ 各池
+    // CDF 都自然饱和到 1.0 (大保底封顶), 这里主要是定位饱和点, 避免在硬保底
+    // 之后的哨兵区做无意义比较; 单调性分支是纯防御。
     constexpr double EPS_SAT = 1e-6;
     int last_valid = cdf_len - 1;
     for (int k = 1; k < cdf_len; ++k) {
@@ -495,18 +410,19 @@ double ComputeKS(const std::array<int, 200>& freq, int max_pity, int n,
 }
 
 // -------------------------------------------------------
-// 统计工具: t 分布 95% 双侧临界值 (α/2 = 0.025)
+// 统计工具:t 分布 95% 双侧临界值 (α/2 = 0.025)
 // -------------------------------------------------------
-// 当样本量较小时 (N < 30), 标准正态 z=1.96 的 CI 会严重低估真实不确定性
+// 当样本量较小时(N < 30),标准正态 z=1.96 的 CI 会严重低估真实不确定性
 // (因为 t 分布尾部更厚)。严格的样本 CI 应该用 t_{α/2, N-1}
 //
 // 实现策略:
-//   df = 1, 2, 3, 4: 查表 (Hill 近似在低 df 误差较大, 最高 0.75%)
-//   df ≥ 5:          用 Hill(1970) 四阶渐近展开 (误差 < 0.02%)
+//   df = 1, 2, 3, 4:查表(Hill 近似在低 df 误差较大,最高 0.75%)
+//   df ≥ 5:用 Hill(1970) 四阶渐近展开(误差 < 0.02%)
 //   df → ∞ 时收敛到 z = 1.959964
 inline double TCritical95(int df) {
+    // α=0.025 双侧 95% CI
     if (df <= 0) return 1.959963984540054;  // 保护
-    // 低自由度查表 (值来自 scipy.stats.t.ppf(0.975, df))
+    // 低自由度查表(值来自 scipy.stats.t.ppf(0.975, df))
     static constexpr double kTable[] = {
         0.0,        // df=0 占位
         12.706205,  // df=1
@@ -536,54 +452,57 @@ inline double TCritical95(int df) {
 }
 
 // -------------------------------------------------------
-// 无偏样本方差 (贝塞尔校正): s² = [Σx² - (Σx)²/N] / (N-1)
-// 注意 N=1 时样本方差未定义 (除零), 返回 0
+// 无偏样本方差(贝塞尔校正):s² = [Σx² - (Σx)²/N] / (N-1)
+// 注意 N=1 时样本方差未定义(除零),返回 0
 // -------------------------------------------------------
 inline double SampleVariance(long long sum, long long sum_sq, int n) {
     if (n <= 1) return 0.0;
-    // 数值稳定式: 避免先算 mean 再做 E[X²]-E[X]² 的灾难性消去
+    // 数值稳定式:避免先算 mean 再做 E[X²]-E[X]² 的灾难性消去
     double numerator = (double)sum_sq - (double)sum * sum / (double)n;
     if (numerator < 0.0) numerator = 0.0;  // 浮点误差保护
     return numerator / (double)(n - 1);
 }
 
-// ---------------------------------------------------------
-// 统计核心
+// -------------------------------------------------------
+// 统计核心 - bucket 已只含目标池子,无需 filter
 //
-// 绝区零与终末地的 UP 判定语义差异:
-//   终末地: 武器池每个 6 星独立 25% 判定 UP, 无大保底
-//   绝区零: 代理人池 50% / 音擎池 75%, 都有大保底("歪了下次必中")
-//   所以代理人池和音擎池在结构上一致 (都是双状态), 只是参数不同.
+// 三个池子的语义 (与 macOS/iOS AnalyzerWrapper.mm 1:1 对齐):
+//   - 独家频段 (Agent):   50% 不歪, 90 硬保底 / 74 起软保底, 有大保底
+//   - 音擎频段 (WEngine): 75% 不歪, 80 硬保底 / 65 起软保底, 有大保底
+//   - 常驻频段 (Standard): 无 UP 概念, 90 硬保底 / 74 起软保底, 仅综合统计
 //
-// 这里 isWEngine 仅用于:
-//   1. 选择对应的理论 CDF 表
-//   2. 输出文本里的措辞
-//   不再像终末地那样切换"独立 25%"和"50/50 大保底"两种语义
+// 关键机制 (区别于终末地):
+//   - 大保底真实存在: 歪了之后下一个 S 级【必定】是当期 UP
+//     → had_non_up 状态机跟踪小/大保底状态
+//   - 水位与大保底状态【永续】: 跨卡池期数保留, 全部记录按 id 升序连续推进,
+//     不做任何期边界重置。删失只发生在记录末尾 (当前在途水位)。
+//   - UP 判定二元化: 出的 S 级不在 standard_names 常驻名单里就是当期 UP
+//     (UP 池里的 S 级只有"当期 UP + 常驻 S"两种来源)
 //
-// 重要差异 (相对终末地武器池): 因为代理人/音擎都有大保底, 所以两个池
-// 都启用 count_win/sum_win/avg_win 来统计"50/50 阶段成功毕业的期望"。
-// 终末地武器池因为是独立 25% 判定无大保底, avg_win 没有物理含义,
-// 所以保持 -1 不输出。这里两个池都会输出"赢下小保底 (不歪) 的出货期望"。
-//
-// UP 判定: 简单规则 — 出的 S 不在 standard_names 常驻名单里, 就是 UP.
-// 这个逻辑成立的前提:
-//   - 绝区零代理人/音擎 UP 池里的 S 级只有"当期 UP + 常驻 S"两种来源
-//   - 常驻名单是相对稳定的 (绝区零开服至今6个常驻代理人 + 6个常驻音擎)
-//   - 用户只需维护这一个常驻列表, 不用每开新池就更新"当期 UP"
-// 这与终末地原版逻辑一致 (终末地也是通过 pool_map 间接做"非UP=常驻"判断,
-// 但绝区零没有歪到"任意非UP角色"的情况, 所以可以直接二元化为"是否常驻").
-// ---------------------------------------------------------
-StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
+// win_5050 / lose_5050 / avg_win:
+//   - had_non_up=false (小保底/50-50 阶段) 时出 UP 计入 "win";
+//     had_non_up=true (大保底) 时出 UP 是必然事件, 不算"赢"。
+//   - 出非 UP S 级: 仅当上一个 S 是 UP (新一轮判定失败) 才计入 lose;
+//     had_non_up=true 时不重复计数 (违反规则的异常数据防御)。
+//   - avg_win (count_win/sum_win): "小保底阶段成功毕业"的样本期望,
+//     代理人/音擎两池都有大保底, 语义一致, 都累计。
+//   - 常驻频段无 UP: 全部 UP 相关字段保持 0 / -1 sentinel。
+// -------------------------------------------------------
+enum class PoolKind : uint8_t { Agent, WEngine, Standard };
+
+StatsResult Calculate(const PullBucket& bucket, PoolKind kind,
                      const std::unordered_set<std::string, StringHash, std::equal_to<>>& standard_names) {
     StatsAccumulator acc;
+    const bool hasUp = (kind != PoolKind::Standard);
     int current_pity = 0, pity_since_last_up = 0;
-    bool had_non_up = false;  // 上一次 S 是否歪了 (用于追踪小/大保底状态)
+    bool had_non_up = false;  // 上一个 S 是否歪了 (小/大保底状态; 跨期永续)
 
     const size_t total = bucket.size();
     for (size_t i = 0; i < total; ++i) {
         ++current_pity;
         ++pity_since_last_up;
 
+        // 非 S 级:likely 分支 (UP 池里也会出 A 级音擎/邦布, 照常推进保底进度)
         if (bucket.rank_types[i] != RankType::RankS) [[likely]] {
             continue;
         }
@@ -596,46 +515,41 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
         acc.sum_all    += slot_all;
         acc.sum_sq_all += (long long)slot_all * slot_all;
 
-        // 判定是否 UP: 不在常驻名单里就是 UP
-        bool isUP = !standard_names.contains(bucket.names[i]);
+        if (hasUp) {
+            // UP 判定: 不在常驻名单里就是当期 UP (二元化)
+            bool isUP = !standard_names.contains(bucket.names[i]);
+            if (isUP) {
+                const int slot_up = pity_since_last_up;
+                if (slot_up < 200) acc.freq_up[slot_up]++;
+                if (slot_up > acc.max_pity_up) acc.max_pity_up = slot_up;
+                acc.count_up++;
+                acc.sum_up    += slot_up;
+                acc.sum_sq_up += (long long)slot_up * slot_up;
 
-        if (isUP) {
-            const int slot_up = pity_since_last_up;
-            if (slot_up < 200) acc.freq_up[slot_up]++;
-            if (slot_up > acc.max_pity_up) acc.max_pity_up = slot_up;
-            acc.count_up++;
-            acc.sum_up    += slot_up;
-            acc.sum_sq_up += (long long)slot_up * slot_up;
-
-            // win_5050: 不歪率统计
-            // had_non_up=false (50/50 状态) 时出 UP 才计入 "win"
-            // had_non_up=true (大保底) 时出 UP 是必然事件, 不算"赢了 50/50"
-            // count_win/sum_win: 仅追踪"50/50 阶段成功毕业"的样本期望
-            if (!had_non_up) {
-                acc.win_5050++;
-                acc.count_win++;
-                acc.sum_win += slot_all;
+                if (!had_non_up) {
+                    // 小保底阶段掷中 UP = 真实的"赢" (大保底必中不计入)
+                    acc.win_5050++;
+                    acc.count_win++;
+                    acc.sum_win += slot_all;
+                }
+                had_non_up = false;
+                pity_since_last_up = 0;
+            } else {
+                // 歪了: 仅小保底阶段计 lose (大保底阶段出非 UP 违反规则, 防御性不计)
+                if (!had_non_up) acc.lose_5050++;
+                had_non_up = true;
             }
-            had_non_up = false;
-            pity_since_last_up = 0;
-        } else {
-            // 出非 UP S
-            // 仅当上一个 S 是 UP (即此次是新一轮的 50/50 失败) 才计入 lose
-            // had_non_up=true 时不重复计数 (违反规则的异常数据 / 跨期继承)
-            if (!had_non_up) {
-                acc.lose_5050++;
-            }
-            had_non_up = true;
         }
         current_pity = 0;
     }
 
-    // 右删失: 遍历结束时若仍有未结算的 pity, 记录为删失样本
-    // 这些抽数"存活"到了 current_pity 抽仍未出 S 级 (或 UP)
+    // 右删失:遍历结束时仍有未结算的水位 → 删失样本
+    // (生存分析: 进分母 risk set, 不进分子 event)。
+    // ZZZ 水位永续 → 全部历史只有这【一个】末尾在途水位是删失样本。
     acc.censored_pity_all = current_pity;
-    acc.censored_pity_up  = pity_since_last_up;
+    acc.censored_pity_up  = hasUp ? pity_since_last_up : 0;
 
-    // 防御性 clamp: 即使数据异常导致 max_pity / censored_pity > 199,
+    // 防御性 clamp:即使数据异常导致 max_pity / censored_pity > 199,
     // 后续 ComputeKS 与 hazard 循环的索引访问也必须安全
     if (acc.max_pity_all > 199) acc.max_pity_all = 199;
     if (acc.max_pity_up  > 199) acc.max_pity_up  = 199;
@@ -654,32 +568,32 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
 
     if (acc.count_all > 0) {
         s.avg_all = (double)acc.sum_all / acc.count_all;
-        // 贝塞尔校正的无偏样本方差 s² = Σ(x-μ)² / (N-1)
-        // N=1 时 s² 未定义, SampleVariance 返回 0 (CI 也自然为 0)
+        // 贝塞尔校正的无偏样本方差; N=1 时 SampleVariance 返回 0(CI 也自然为 0)
         double var = SampleVariance(acc.sum_all, acc.sum_sq_all, acc.count_all);
         double std_all = std::sqrt(var);
         s.cv_all = (s.avg_all > 0) ? std_all / s.avg_all : 0;
-        // CI 使用 t 分布临界值 (自由度 N-1), 小样本下比 z=1.96 更保守正确
+        // CI 使用 t 分布临界值(自由度 N-1),小样本下比 z=1.96 更保守正确
         double t_crit = TCritical95(acc.count_all - 1);
         s.ci_all_err = t_crit * std_all / std::sqrt((double)acc.count_all);
 
-        // K-S 检验: 代理人池用 g_cdf_agent, 音擎池用 g_cdf_wengine
-        const double* cdf_tbl = isWEngine ? g_cdf_wengine : g_cdf_agent;
-        int cdf_len = isWEngine ? 82 : 92;
+        // K-S 检验:代理人/常驻池用 g_cdf_agent (同分布),音擎池用 g_cdf_wengine
+        const std::span<const double> cdf_tbl = (kind == PoolKind::WEngine)
+            ? std::span<const double>(g_cdf_wengine)   // 82
+            : std::span<const double>(g_cdf_agent);    // 92
         s.ks_d_all = ComputeKS(acc.freq_all, acc.max_pity_all, acc.count_all,
-                               cdf_tbl, cdf_len);
+                               cdf_tbl);
         s.ks_is_normal = (s.ks_d_all <= (1.36 / std::sqrt((double)acc.count_all)));
     }
 
     // Kaplan-Meier 式经验风险函数 - 综合 S 级:
-    //   risk set 初值 = 全部观测样本 (已毕业 + 删失)
+    //   risk set 初值 = 全部观测样本(已毕业 + 删失)
     //   到 x 抽时 hazard[x] = freq[x] / survivors
-    //   survivors 每步先减去事件 (freq[x]), 再减去在 x 发生的删失
-    // 即使 count_all=0 也要处理: 用户可能从未出 S 级但已垫 N 抽 (极少见但有效)
+    //   survivors 每步先减去事件(freq[x]),再减去在 x 发生的删失
+    // 即使 count_all=0 也要处理:用户可能从未出 S 级但已垫 N 抽(极少见但有效)
     if (acc.count_all > 0 || acc.censored_pity_all > 0) {
         int survivors = acc.count_all + (acc.censored_pity_all > 0 ? 1 : 0);
         int max_reach_all = (std::max)(acc.max_pity_all, acc.censored_pity_all);
-        if (max_reach_all > 199) max_reach_all = 199;  // 防御性 clamp (已被上游保证, 这里再防一道)
+        if (max_reach_all > 199) max_reach_all = 199;  // 防御性 clamp
         for (int x = 1; x <= max_reach_all; ++x) {
             if (survivors > 0) {
                 s.hazard_all[x] = (double)acc.freq_all[x] / survivors;
@@ -696,11 +610,14 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
         double t_crit = TCritical95(acc.count_up - 1);
         s.ci_up_err = t_crit * std_up / std::sqrt((double)acc.count_up);
 
-        // UP K-S 检验: 用 g_cdf_*_up 双状态前向迭代得到的 UP 分布
-        const double* cdf_up_tbl = isWEngine ? g_cdf_wengine_up : g_cdf_agent_up;
-        int cdf_up_len = isWEngine ? 162 : 182;
+        // UP K-S 检验: 用双状态前向迭代得到的 g_cdf_*_up。
+        // ZZZ 全部是单抽粒度判定, 无终末地武器池那种"申领聚合"需求,
+        // 经验 freq_up 直接与理论 CDF 逐抽比较。
+        const std::span<const double> cdf_up_tbl = (kind == PoolKind::WEngine)
+            ? std::span<const double>(g_cdf_wengine_up)   // 162
+            : std::span<const double>(g_cdf_agent_up);    // 182
         s.ks_d_up = ComputeKS(acc.freq_up, acc.max_pity_up, acc.count_up,
-                              cdf_up_tbl, cdf_up_len);
+                              cdf_up_tbl);
         s.ks_is_normal_up = (s.ks_d_up <= (1.36 / std::sqrt((double)acc.count_up)));
     }
 
@@ -724,7 +641,10 @@ StatsResult Calculate(const PullBucket& bucket, bool isWEngine,
 
     return s;
 }
+
 // ---------------------------------------------------------
+// [RAII 句柄]
+// ---------------------------------------------------------// ---------------------------------------------------------
 // [RAII 句柄]
 // ---------------------------------------------------------
 struct FileGuard {
@@ -742,67 +662,75 @@ struct ViewGuard {
     ~ViewGuard() { if (p) UnmapViewOfFile(p); }
 };
 
+// ---------------------------------------------------------
+// 文件处理
+// ---------------------------------------------------------
 // 安全读取动态长度的 Edit 控件文本
-// 固定 wchar_t[N] 在用户粘贴超长文本时会被 GetWindowTextW 截断,
-// 下游解析看到的是不完整数据 → 丢映射。先 GetWindowTextLengthW 查长度
-// 再按需分配, 彻底消除截断风险
+// 原版固定 wchar_t[4096] 在用户粘贴超长 UP 映射文本时会被 GetWindowTextW 截断,
+// 下游解析看到的是不完整数据 → 丢失记录。
+// 先 GetWindowTextLengthW 查长度再按需分配,彻底消除截断风险
 inline std::wstring GetDynamicWindowText(HWND hwnd) {
     int len = GetWindowTextLengthW(hwnd);
     if (len <= 0) return L"";
-    std::wstring buf((size_t)len, L'\0');
-    GetWindowTextW(hwnd, buf.data(), len + 1);  // GetWindowTextW 需要 len+1 容纳末尾 '\0'
+    // v0.1.3.3: GetWindowTextLengthW 对 RichEdit 文档明示"可能大于实际长度"(估计值)。
+    // 旧写法忽略 GetWindowTextW 的实际拷贝数, 高估时 wstring 尾部残留 L'\0' 填充;
+    // 这些 NUL 经 WideToUtf8 原样转换, 粘在名单最后一个 token 上 (TrimUtf8 只剥空白
+    // 不剥 '\0'), 导致最后一个常驻名 / 最后一条 UP 映射永远匹配不上 JSON 里的名字,
+    // 统计被静默污染。修复: 按实际拷贝数 resize。
+    std::wstring buf((size_t)len + 1, L'\0');
+    int copied = GetWindowTextW(hwnd, buf.data(), len + 1);
+    buf.resize(copied > 0 ? (size_t)copied : 0);
     return buf;
 }
 
 // ---------------------------------------------------------
 // [文件处理 - 工作线程化]
 //
-// 同步处理模式下 WM_DROPFILES 会阻塞窗口消息循环, 用户无法移动窗口/输入/
-// 最小化。这里改为异步:
-//   1) 主线程做 I/O 准备 (读 GUI 文本框 + mmap 文件)
-//   2) Worker 线程做纯 CPU 计算 (JSON 解析 + Calculate), 结果写入 heap
-//      上的 ProcessOutput 对象
+// 原版 WM_DROPFILES 同步调 ProcessFile + RebuildChartCache,期间窗口消息
+// 循环阻塞,用户无法移动窗口/输入/最小化。重构后:
+//   1) 主线程做 I/O 准备(读 GUI 文本框 + 把文件内容拷到 std::string)
+//   2) Worker 线程做纯 CPU 计算(JSON 解析 + Calculate),结果写入 heap 上
+//      的 ProcessOutput 对象
 //   3) Worker 用 PostMessage(WM_APP_PROCESS_DONE) 把结果指针回投到主线程
-//   4) 主线程在该消息处理中更新 statsAgent/statsWEngine + UI, 然后 delete output
+//   4) 主线程在该消息处理中更新 statsAgent/statsWEngine/statsStandard + UI,然后 delete output
 //
 // 注意:
-//   - GDI / SetWindowTextW 都不是 thread-safe, 只能在主线程调
-//   - statsAgent/statsWEngine 是全局, WM_PAINT 通过 g_hChartBmp 间接读它们,
-//     但 g_hChartBmp 由 RebuildChartCache 重建, 所以只要 RebuildChartCache
-//     和 statsAgent 写入都在主线程串行, 就不需要锁
-//   - g_processing 标志防止 worker 跑时重复触发 (双开 worker)
+//   - GDI / SetWindowTextW 都不是 thread-safe,只能在主线程调
+//   - statsAgent/statsWEngine/statsStandard 是全局,WM_PAINT 通过 g_hChartBmp 间接读它们,
+//     但 g_hChartBmp 由 RebuildChartCache 重建,所以只要 RebuildChartCache
+//     和 stats 写入都在主线程串行,就不需要锁
+//   - g_processing 标志防止 worker 跑时重复触发(双开 worker)
+//   - 线程句柄保留在 g_hWorker (主线程独占): 下次 Submit 开头与 WM_DESTROY 时
+//     join + CloseHandle, 保证进程退出前 worker 已完整走完 CRT 尾声 (见 WM_DESTROY)
 // ---------------------------------------------------------
+
 #define WM_APP_PROCESS_DONE  (WM_APP + 1)
 
-// 前向声明: RebuildChartCache 定义在 DrawECDF/DrawMRL 之后, 但 ProcessFile_Consume
+// 前向声明:RebuildChartCache 定义在 DrawECDF/DrawMRL 之后,但 ProcessFile_Consume
 // 需要在文件中段调用它。
 void RebuildChartCache(HWND hwnd);
 
-// 跨线程载荷: 主线程构造, worker 填充结果, 主线程消费后 delete
+// 跨线程载荷:主线程构造,worker 填充结果,主线程消费后 delete
 struct ProcessOutput {
-    HWND        hwnd_main = NULL;  // 主窗口, worker 用 PostMessage 回投到这里
+    HWND        hwnd_main = NULL;  // 主窗口,worker 用 PostMessage 回投到这里
 
-    // === 主线程预填 (由 ProcessFile_Submit 设置) ===
-    // 文件 buffer 用 mmap 直读, 零拷贝。三个 handle 必须存活到 Consume 阶段
-    // 才能 unmap/close, 因为 worker 内的 string_view 都指向 mmap 区域。
+    // === 主线程预填(由 ProcessFile_Submit 设置) ===
+    // 文件 buffer 用 mmap 直读,零拷贝(与原版 ProcessFile + macOS Analyzer 对齐)。
+    // 三个 handle 必须存活到 Consume 阶段才能 unmap/close,因为 ExportRecord
+    // 内的 string_view 都指向 mmap 区域。
     HANDLE      hFile = INVALID_HANDLE_VALUE;
     HANDLE      hMap  = NULL;
     const void* viewPtr = nullptr;
-    DWORD       fileSize = 0;
+    size_t      fileSize = 0;   // v0.1.3.2: DWORD → size_t, 配合 GetFileSizeEx (不再 32 位截断)
 
-    // 输入文本: 仅 2 个输入框
-    //   utf8_agentStd:   常驻 S 级代理人
-    //   utf8_wengineStd: 常驻 S 级音擎
-    // UP 判定逻辑: S 级名字不在常驻列表里, 就是 UP. 简单且稳定 — 用户只需维护
-    // 这一份相对静态的"常驻 S 级"列表 (绝区零开服至今 6 个常驻代理人 + 6 个常驻音擎).
-    // 不需要每开新池就更新 "当期 UP" 列表.
-    std::string utf8_agentStd;
-    std::string utf8_wengineStd;
+    std::string utf8_agents;    // 来自 hAgentEdit (GUI 控件文本必须主线程 GetWindowText)
+    std::string utf8_wengines;  // 来自 hWEngineEdit
 
     // === worker 填充 ===
     bool        ok = false;
     StatsResult statsAgent;
     StatsResult statsWEngine;
+    StatsResult statsStandard;
     std::wstring outMsg;
     std::wstring errMsg;
 
@@ -814,15 +742,27 @@ struct ProcessOutput {
     }
 };
 
-// 用全局原子防双开; Win32 上 LONG volatile + InterlockedExchange 等价于 atomic_flag
+// 用全局原子防双开;Win32 上 LONG volatile + InterlockedExchange 等价于 atomic_flag
 static volatile LONG g_processing = 0;
 
-// Worker 线程入口: 纯 CPU 工作, 不碰任何 GUI
-DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
+// worker 线程句柄, 仅主线程读写。生命周期: Submit 创建 → (a) 下次 Submit 开头
+// join+close (此刻上一个 worker 早已投递结果/自清理, 最多剩微秒级 CRT 尾声), 或
+// (b) WM_DESTROY join+close (退出前兜底)。不在 Consume 里关闭: 投递结果 ≠ 线程已
+// 退出, 提前关闭会失去 join 能力, 留下 "ExitProcess 终止恰好持有 CRT 堆锁的尾声
+// 线程 → 退出挂死" 的风险窗口。
+static HANDLE g_hWorker = NULL;
+
+// Worker 线程入口:纯 CPU 工作,不碰任何 GUI。
+// 用 _beginthreadex 启动 (见 ProcessFile_Submit), 故签名是 unsigned __stdcall(void*) ——
+// 这样 worker 里用到的 CRT (std::string/unordered_map/swprintf/std::ranges::sort/异常等)
+// 的 per-thread 状态能被正确初始化与清理; 裸 CreateThread 跑 CRT 在极端低内存下有终止
+// 进程的风险 (见 ProcessFile_Submit 的说明)。
+unsigned __stdcall ProcessFile_Worker(void* arg) {
     auto* out = (ProcessOutput*)arg;
 
-    auto agentStd   = ParseCommaSeparatedUtf8FromUtf8(out->utf8_agentStd);
-    auto wengineStd = ParseCommaSeparatedUtf8FromUtf8(out->utf8_wengineStd);
+    // 解析输入(WideToUtf8 已经在主线程做完,这里直接用 utf8 视图)
+    auto stdAgents   = ParseCommaSeparatedUtf8FromUtf8(out->utf8_agents);
+    auto stdWEngines = ParseCommaSeparatedUtf8FromUtf8(out->utf8_wengines);
 
     std::string_view bufferView((const char*)out->viewPtr, out->fileSize);
     if (bufferView.size() >= 3 &&
@@ -832,19 +772,35 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
         bufferView.remove_prefix(3);
     }
 
-    // PMR: 栈上 2MB 内存池
-    // worker 线程在 ProcessFile_Submit 中以 4MB 栈创建, 容得下这 2MB 缓冲区。
-    // 栈池 vs 堆池的性能差异:
-    //   - 分配/释放开销 0 (栈指针偏移 vs malloc 一次 2MB)
-    //   - 与 worker 栈的局部变量物理相邻, L1/L2 热, TLB 不会 miss
-    //   - 整个 PMR 工作集 (temps + bucketAgent + bucketWEngine) 都从此池分配, 锁在热区
-    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
-    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
+    // PMR:2MB 单调缓冲池 (monotonic_buffer_resource)。v0.1.3.2 起【改放堆上】(此前在栈上)。
+    //
+    // 为什么从栈改到堆 (用 make_unique_for_overwrite, 而不是 std::vector<std::byte>(2MB)):
+    //   - 修正 v0.1.3.1 的一处错误结论: 当时注释说"栈版只有真正写入的 ~600KB 才落到物理页",
+    //     这不对。固定 2MB 栈帧 >= 1 页时 MSVC 序言会调 __chkstk 逐页探测【整块 2MB】以保证栈
+    //     能安全扩展 —— 进入 worker 时这 2MB 就被全部触达/提交, 与 PMR 实际用多少无关。
+    //   - 反而堆写法更省: make_unique_for_overwrite 不清零 (区别于 std::vector(2MB) / 带括号的
+    //     new[]() / calloc 那种值初始化), 内存按需触页 —— 只有 PMR 真正写到的 ~600KB 才 fault-in
+    //     成物理页, 不像栈版被 __chkstk 强行摸满 2MB。
+    //   - 顺带: 不再需要给 worker 配 4MB 栈 (见 ProcessFile_Submit), 线程栈回默认即可,
+    //     去掉了那处 STACK_SIZE_PARAM_IS_A_RESERVATION 特殊化。
+    //   - (先前感到"堆版更卡"是因为当时用了会清零的写法; 本写法无清零, 不复现该开销。)
+    // 关于缓存: 别再写"L1/L2 热 / TLB 不 miss"。2MB = 512 页, 远超 L1(~48KB) 和 L1 DTLB(~64 项);
+    //   能保证的只是减少分配器调用 + 让 temps/bucket 集中在一段连续内存 (利于顺序访问的局部性)。
+    //   真实命中率要用 PMU 实测。
+    // 关于 fallback: pool 没显式指定 upstream, 默认 = get_default_resource() (= new_delete_resource)。
+    //   故【不是】严格只用这 2MB: 超大导入耗尽后会 fallback 到堆而非崩溃 (有意为之, 比抛 bad_alloc
+    //   退出更实用)。另注 monotonic_buffer_resource 不回收 vector 扩容前的旧块, 直到整个 pool 析构
+    //   —— 一旦 reserve() 预估被大幅突破, arena 占用会比普通 allocator 涨得快。
+    //
+    // 生命周期: 声明顺序 arena → pool → alloc, 析构逆序 (alloc/pool 先, arena 后), 故 pool 引用
+    //   的 arena 内存在 pool 存活期间始终有效; 各 pmr 容器声明在 alloc 之后, 会更早析构。
+    constexpr size_t kArenaSize = 2 * 1024 * 1024;
+    auto arena = std::make_unique_for_overwrite<std::byte[]>(kArenaSize);  // 堆, 不清零 (C++20)
+    std::pmr::monotonic_buffer_resource pool(arena.get(), kArenaSize);
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
     struct Temp {
         long long id;
-        ItemType  it;
         GachaType gt;
         RankType  rt;
         std::string_view name;
@@ -852,24 +808,31 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     std::pmr::vector<Temp> temps(alloc);
     temps.reserve(10000);
 
-    // ForEachJsonObject 找的是 "list" 这个 key.
-    // UIGF v4.2 的 nap 顶层结构:
-    //   { "info": {...},
-    //     "nap": [ { "uid", "timezone", "lang", "list": [ {...}, {...}, ... ] } ] }
-    // 顶层 info 没有 list, nap[0] 内层有, 所以直接命中正确数组.
-    // (这个 ForEachJsonObject 实现只匹配第一处 "list", 多账号文件会被截断,
-    //  但 UIGF v4.2 nap 数组通常只有一个 uid 元素, 实际不影响.)
-    ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
-        ItemType  it = ParseItemType (ExtractJsonValue(itemStr, "item_type",  true));
+    // UIGF v4.2 文件可能同时含多个游戏段 (hk4e/hkrpg/nap/...), 每段内层都有
+    // "list" —— 直接找全文件第一个 "list" 可能命中别的游戏。先定位 "nap" key,
+    // 在其后子串内找 "list" (nap[0] 结构: { uid, timezone, lang, list }, info 块
+    // 没有 list, 所以 nap 子串内第一个 "list" 即正确记录数组); 找不到 "nap" 才
+    // 回退全文件搜索 (兼容只含 ZZZ 数据的宽松第三方文件)。
+    std::string_view napScope = bufferView;
+    {
+        size_t napPos = FindJsonKey(bufferView, "nap");
+        if (napPos != std::string_view::npos) napScope = bufferView.substr(napPos);
+    }
+
+    ForEachJsonObject(napScope, "list", [&](std::string_view itemStr) {
+        // UIGF v4.2 nap 字段:
+        //   - "gacha_type" 数字字符串 ("1"/"2"/"3"/"5")
+        //   - "rank_type"  "2"/"3"/"4" (B/A/S)
+        //   - "name" 物品名
         RankType  rt = ParseRankType (ExtractJsonValue(itemStr, "rank_type",  true));
         GachaType gt = ParseGachaType(ExtractJsonValue(itemStr, "gacha_type", true));
 
-        // 只关心代理人 UP 池("2") 和音擎 UP 池("3")
-        // 常驻("1")/邦布("5") 不进入分析 (没有 UP 概念, 分析意义不大)
-        // 此外: 代理人 UP 池里也会出"音擎/邦布 A 级", 这些不是 S 级出货, 不影响分析
-        if (gt != GachaType::AgentUP && gt != GachaType::WEngineUP) return;
+        // 分析对象: 独家("2") + 音擎("3") + 常驻("1"); 邦布("5") 跳过。
+        // 注: UP 池里也会出 A 级音擎/邦布, 这些非 S 级抽数照常推进保底进度,
+        //     按 gacha_type 分桶 (而非 item_type), 语义才正确。
+        if (gt != GachaType::AgentUP && gt != GachaType::WEngineUP &&
+            gt != GachaType::Standard) return;
 
-        // ZZZ name 字段名是 "name" (不是终末地的 "item_name")
         std::string_view name = ExtractJsonValue(itemStr, "name", true);
 
         std::string_view idStr = ExtractJsonValue(itemStr, "id", true);
@@ -879,18 +842,25 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
             std::from_chars(idStr.data(), idStr.data() + idStr.size(), parsed_id);
         }
 
-        temps.push_back(Temp{parsed_id, it, gt, rt, name});
+        temps.push_back(Temp{parsed_id, gt, rt, name});
     });
 
     if (temps.empty()) {
         out->ok = false;
-        out->errMsg = L"JSON 解析失败或无数据。";
-        PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out);
+        out->errMsg = L"JSON 解析失败或无数据 (未找到 nap.list 记录)。";
+        // 防御分支: WM_DESTROY 会先 join 本线程再销毁窗口, "关窗导致 HWND 失效"
+        // 已不会发生; PostMessageW 仍可能因极端情况失败 (如线程消息队列满 10000 条)。
+        // 失败则没人消费 out → worker 自己清理, 否则泄漏 ProcessOutput + mmap 句柄,
+        // 且 g_processing 卡在 1。out 在 Submit 里已 release 给 worker, 此处归 worker 所有。
+        if (!PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out)) {
+            delete out;
+            InterlockedExchange(&g_processing, 0);
+        }
         return 0;
     }
 
-    // 排序: 绝区零的 id 是 19 位全局递增 ID, 直接按 id 升序就是按时间升序.
-    // 不需要终末地版本里"角色武器分区 + 时间戳排序"的复杂规则.
+    // 排序: ZZZ 的 id 是 19 位全局递增正整数, 单关键字升序 = 时间升序
+    // (不需要终末地的"武器取负分区 + |id|"三级排序)
     auto less = [](const Temp& a, const Temp& b) { return a.id < b.id; };
     bool sorted = true;
     for (size_t i = 1; i < temps.size(); ++i) {
@@ -898,129 +868,151 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     }
     if (!sorted) std::ranges::sort(temps, less);
 
-    PullBucket bucketAgent  (alloc); bucketAgent.reserve(6000);
-    PullBucket bucketWEngine(alloc); bucketWEngine.reserve(4000);
+    // 分桶: 按 gacha_type 分到 独家 / 音擎 / 常驻 三个桶
+    PullBucket bucketAgent   (alloc); bucketAgent.reserve(6000);
+    PullBucket bucketWEngine (alloc); bucketWEngine.reserve(4000);
+    PullBucket bucketStandard(alloc); bucketStandard.reserve(4000);
     for (const auto& t : temps) {
-        if (t.gt == GachaType::AgentUP) {
-            bucketAgent.push_back(t.rt, t.name);
-        } else if (t.gt == GachaType::WEngineUP) {
-            bucketWEngine.push_back(t.rt, t.name);
-        }
+        if      (t.gt == GachaType::AgentUP)   bucketAgent  .push_back(t.rt, t.name);
+        else if (t.gt == GachaType::WEngineUP) bucketWEngine.push_back(t.rt, t.name);
+        else                                   bucketStandard.push_back(t.rt, t.name);
     }
 
-    out->statsAgent   = Calculate(bucketAgent,   /*isWEngine=*/false, agentStd);
-    out->statsWEngine = Calculate(bucketWEngine, /*isWEngine=*/true,  wengineStd);
+    out->statsAgent    = Calculate(bucketAgent,    PoolKind::Agent,    stdAgents);
+    out->statsWEngine  = Calculate(bucketWEngine,  PoolKind::WEngine,  stdWEngines);
+    out->statsStandard = Calculate(bucketStandard, PoolKind::Standard, stdAgents);
 
-    wchar_t winAgentStr[64] = L"[无数据]";  // [无数据]
+    // 在 worker 渲染输出文本(swprintf 是 thread-safe;只有 SetWindowTextW 不是)
+    wchar_t winAgentStr[64] = L"[无数据]";
     if (out->statsAgent.avg_win >= 0)
-        swprintf(winAgentStr, 64, L"%.2f 抽", out->statsAgent.avg_win);  // X 抽
-
+        swprintf(winAgentStr, 64, L"%.2f 抽", out->statsAgent.avg_win);
     wchar_t winWEngineStr[64] = L"[无数据]";
     if (out->statsWEngine.avg_win >= 0)
         swprintf(winWEngineStr, 64, L"%.2f 抽", out->statsWEngine.avg_win);
 
-    wchar_t pendAgentStr[128] = L"";
+    wchar_t pendAgentStr[96] = L"";
     if (out->statsAgent.censored_pity_all > 0 || out->statsAgent.censored_pity_up > 0) {
-        // [当前垫刀: 距上次S级 N 抽 / 距上次UP M 抽]
-        swprintf(pendAgentStr, 128,
-            L"  [当前垫刀: 距上次S级 %d 抽 / 距上次UP %d 抽]",
-            out->statsAgent.censored_pity_all, out->statsAgent.censored_pity_up);
+        swprintf(pendAgentStr, 96, L"  [当前水位: 距上次S级 %d 抽 / 距上次 UP %d 抽]",
+                 out->statsAgent.censored_pity_all, out->statsAgent.censored_pity_up);
     }
-    wchar_t pendWEngineStr[128] = L"";
+    wchar_t pendWEngineStr[96] = L"";
     if (out->statsWEngine.censored_pity_all > 0 || out->statsWEngine.censored_pity_up > 0) {
-        swprintf(pendWEngineStr, 128,
-            L"  [当前垫刀: 距上次S级 %d 抽 / 距上次UP %d 抽]",
-            out->statsWEngine.censored_pity_all, out->statsWEngine.censored_pity_up);
+        swprintf(pendWEngineStr, 96, L"  [当前水位: 距上次S级 %d 抽 / 距上次 UP %d 抽]",
+                 out->statsWEngine.censored_pity_all, out->statsWEngine.censored_pity_up);
+    }
+    wchar_t pendStandardStr[96] = L"";
+    if (out->statsStandard.censored_pity_all > 0) {
+        swprintf(pendStandardStr, 96, L"  [当前水位: 距上次S级 %d 抽]",
+                 out->statsStandard.censored_pity_all);
     }
 
     auto ksLabel = [](const StatsResult& r) -> const wchar_t* {
         if (r.count_all == 0) return L"-";
-        return r.ks_is_normal
-            ? L"符合理论模型"   // 符合理论模型
-            : L"偏离过大";                          // 偏离过大
+        return r.ks_is_normal ? L"符合理论模型" : L"偏离过大";
     };
     auto ksUpLabel = [](const StatsResult& r) -> const wchar_t* {
         if (r.count_up == 0) return L"-";
-        return r.ks_is_normal_up
-            ? L"符合理论模型"
-            : L"偏离过大";
+        return r.ks_is_normal_up ? L"符合理论模型" : L"偏离过大";
     };
+    const wchar_t* ksAgentLabel      = ksLabel  (out->statsAgent);
+    const wchar_t* ksWEngineLabel    = ksLabel  (out->statsWEngine);
+    const wchar_t* ksStandardLabel   = ksLabel  (out->statsStandard);
+    const wchar_t* ksAgentUpLabel    = ksUpLabel(out->statsAgent);
+    const wchar_t* ksWEngineUpLabel  = ksUpLabel(out->statsWEngine);
 
-    // 文本里的所有中文都用 wchar_t 字面量更清晰; 但为了对齐排版用 \xXX 序列也可
-    // 这里直接写 L"中文"
-    wchar_t outMsg[3200];
-    // 理论值参考:
-    //   代理人池综合 6 星: 62.30 抽
-    //   代理人池 UP:        93.45 抽
-    //   音擎池综合 6 星:    49.71 抽
-    //   音擎池 UP:          62.13 抽
-    swprintf(outMsg, 3200,
+    // 4096 字符缓冲: 三段池块 (独家/音擎各 4 行 + 常驻 3 行) 约 2200 字符,
+    // 留足余量避免 swprintf 截断 (截断会让 SetWindowTextW 显示残缺尾巴)。
+    wchar_t outMsg[4096];
+    swprintf(outMsg, 4096,
         L"【独家频段 (代理人 UP 池)】 总计 S 级: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合 S 级 (含歪) 出货平均期望:     %5.2f 抽 (理论 ≈ 62.30)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
-        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 93.45)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%) (%d 胜 %d 负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
+        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 93.45)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
         L" ▶ 赢下小保底 (不歪) 的出货期望:     %ls\r\n\r\n"
         L"【音擎频段 (武器 UP 池)】 总计 S 级: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合 S 级 (含歪) 出货平均期望:     %5.2f 抽 (理论 ≈ 49.71)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
-        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 62.13)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 75%%) (%d 胜 %d 负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
-        L" ▶ 赢下小保底 (不歪) 的出货期望:     %ls",
+        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 62.13)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 75%%) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
+        L" ▶ 赢下小保底 (不歪) 的出货期望:     %ls\r\n\r\n"
+        L"【常驻频段 (热门卡司)】 总计 S 级: %d%ls\r\n"
+        L" ▶ 综合 S 级出货平均期望:             %5.2f 抽 (理论 ≈ 62.30)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
+        L" ▶ (常驻频段无 UP 概念; 新人保底/300抽自选不在抽卡记录内, 早期样本可能轻微偏离理论)",
         out->statsAgent.count_all, out->statsAgent.count_up, pendAgentStr,
         out->statsAgent.avg_all, (std::max)(1.0, out->statsAgent.avg_all - out->statsAgent.ci_all_err),
         out->statsAgent.avg_all + out->statsAgent.ci_all_err, out->statsAgent.cv_all * 100.0,
-        out->statsAgent.ks_d_all, ksLabel(out->statsAgent),
+        out->statsAgent.ks_d_all, ksAgentLabel,
         out->statsAgent.avg_up, (std::max)(1.0, out->statsAgent.avg_up - out->statsAgent.ci_up_err),
         out->statsAgent.avg_up + out->statsAgent.ci_up_err,
         out->statsAgent.win_rate_5050 >= 0 ? out->statsAgent.win_rate_5050 * 100.0 : 0.0,
         out->statsAgent.win_5050, out->statsAgent.lose_5050,
-        out->statsAgent.ks_d_up, ksUpLabel(out->statsAgent),
+        out->statsAgent.ks_d_up, ksAgentUpLabel,
         winAgentStr,
         out->statsWEngine.count_all, out->statsWEngine.count_up, pendWEngineStr,
         out->statsWEngine.avg_all, (std::max)(1.0, out->statsWEngine.avg_all - out->statsWEngine.ci_all_err),
         out->statsWEngine.avg_all + out->statsWEngine.ci_all_err, out->statsWEngine.cv_all * 100.0,
-        out->statsWEngine.ks_d_all, ksLabel(out->statsWEngine),
+        out->statsWEngine.ks_d_all, ksWEngineLabel,
         out->statsWEngine.avg_up, (std::max)(1.0, out->statsWEngine.avg_up - out->statsWEngine.ci_up_err),
         out->statsWEngine.avg_up + out->statsWEngine.ci_up_err,
         out->statsWEngine.win_rate_5050 >= 0 ? out->statsWEngine.win_rate_5050 * 100.0 : 0.0,
         out->statsWEngine.win_5050, out->statsWEngine.lose_5050,
-        out->statsWEngine.ks_d_up, ksUpLabel(out->statsWEngine),
-        winWEngineStr
+        out->statsWEngine.ks_d_up, ksWEngineUpLabel,
+        winWEngineStr,
+        out->statsStandard.count_all, pendStandardStr,
+        out->statsStandard.avg_all, (std::max)(1.0, out->statsStandard.avg_all - out->statsStandard.ci_all_err),
+        out->statsStandard.avg_all + out->statsStandard.ci_all_err, out->statsStandard.cv_all * 100.0,
+        out->statsStandard.ks_d_all, ksStandardLabel
     );
     out->outMsg = outMsg;
+    out->ok = true;    out->outMsg = outMsg;
     out->ok = true;
 
-    PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out);
+    // 同上的防御分支 (消息队列满等极端失败)。窗口关闭路径已由 WM_DESTROY 收口:
+    // 先 join 本线程 (彼时 hwnd 仍有效, 本行 PostMessageW 必然成功入队), 再 reap 队列里
+    // 这条永远不会被派发的结果消息并释放载荷 —— 见 WndProc 的 WM_DESTROY。
+    // (v0.1.3.3 修正: 旧注释称"由 ExitProcess 统一回收, 无实际危害, 不加 join" —— 结论
+    //  不成立: ExitProcess 会直接终止其它线程, worker 若恰好在 CRT 堆锁内被终止, 退出
+    //  流程可能挂死。现已改为退出前必 join, 该风险窗口不复存在。)
+    if (!PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out)) {
+        delete out;
+        InterlockedExchange(&g_processing, 0);
+    }
     return 0;
 }
 
-// 主线程入口: 做 I/O 准备 + 启动 worker。
-// 返回 false 表示提交失败 (应立即清理), true 表示 worker 已启动
-// (WM_APP_PROCESS_DONE 会在完成时投递)。
+// 主线程入口:做 I/O 准备 + 启动 worker。
+// 返回 false 表示提交失败(应立即清理),true 表示 worker 已启动(WM_APP_PROCESS_DONE
+// 会在完成时投递)。
 bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
-    // 双开保护: 用 InterlockedCompareExchange 原子地把 0->1
+    // 双开保护:用 InterlockedCompareExchange 原子地把 0->1
     if (InterlockedCompareExchange(&g_processing, 1, 0) != 0) {
-        return false;  // 已有 worker 在跑, 忽略本次拖入
+        return false;  // 已有 worker 在跑,忽略本次拖入
     }
 
     auto out = std::make_unique<ProcessOutput>();
     out->hwnd_main = hwnd;
 
-    // 主线程读 GUI 控件文本 (子控件的 GetWindowTextW 不允许从 worker 调)
-    out->utf8_agentStd   = WideToUtf8(GetDynamicWindowText(hAgentEdit));
-    out->utf8_wengineStd = WideToUtf8(GetDynamicWindowText(hWEngineEdit));
+    // 主线程读 GUI 控件文本(子控件的 GetWindowTextW 不允许从 worker 调)
+    out->utf8_agents   = WideToUtf8(GetDynamicWindowText(hAgentEdit));
+    out->utf8_wengines = WideToUtf8(GetDynamicWindowText(hWEngineEdit));
 
-    // 主线程做文件 mmap, 所有权直接交给 ProcessOutput (零拷贝)。
-    // mmap view 在 worker 持有期间一直有效, Consume 阶段 ProcessOutput 析构统一 unmap。
-    // 失败路径下也由 unique_ptr<ProcessOutput> 析构正确清理 (已分配的资源)。
+    // 主线程做文件 mmap,所有权直接交给 ProcessOutput(零拷贝)。
+    // mmap view 在 worker 持有期间一直有效,Consume 阶段 ProcessOutput 析构统一 unmap。
+    // 失败路径下也由 unique_ptr<ProcessOutput> 析构正确清理(已分配的资源)。
     out->hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (out->hFile == INVALID_HANDLE_VALUE) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
-    out->fileSize = GetFileSize(out->hFile, NULL);
-    if (out->fileSize == 0 || out->fileSize == INVALID_FILE_SIZE) {
+    // v0.1.3.2: GetFileSize (32 位, 截断 >4GB) → GetFileSizeEx (64 位)。抽卡文件正常远小于 4GB,
+    // 但输入来自外部文件, 用 64 位读 + 显式上界校验更稳健 (尤其 32 位构建下 size_t 仅 4GB)。
+    LARGE_INTEGER fileSize64{};
+    if (!GetFileSizeEx(out->hFile, &fileSize64) ||
+        fileSize64.QuadPart <= 0 ||
+        static_cast<unsigned long long>(fileSize64.QuadPart) >
+            static_cast<unsigned long long>(SIZE_MAX)) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
+    out->fileSize = static_cast<size_t>(fileSize64.QuadPart);
     out->hMap = CreateFileMappingW(out->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!out->hMap) {
         InterlockedExchange(&g_processing, 0);
@@ -1032,16 +1024,31 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
         return false;
     }
 
-    // 启动 worker. 显式指定 4MB 栈 (与主线程 /STACK:4194304 对齐;
-    // CreateThread 默认栈只 1MB, 容纳不下 worker 内部的 2MB PMR 栈池)。
-    // 注意: dwStackSize 是预留+commit, Windows 实际只 commit 必要页, 常驻内存仅约 1 页。
-    HANDLE hThread = CreateThread(NULL, 4 * 1024 * 1024,
-                                  ProcessFile_Worker, out.get(), 0, NULL);
-    if (!hThread) {
+    // v0.1.3.3: 回收上一个 worker 的句柄 (若有)。能走到这里说明 CAS 已拿到锁, 即上一个
+    // worker 已投递结果 (Consume 清零 g_processing) 或已自清理 —— 其线程最多只剩微秒级的
+    // CRT 尾声, 此处 join 几乎不阻塞, 换来句柄零泄漏 + 任意时刻至多一个未决句柄。
+    if (g_hWorker) {
+        WaitForSingleObject(g_hWorker, INFINITE);
+        CloseHandle(g_hWorker);
+        g_hWorker = NULL;
+    }
+
+    // 启动 worker。v0.1.3.2: 2MB PMR arena 已挪到堆 (见 ProcessFile_Worker), worker 栈需求很小,
+    // 故 stack_size 传 0 (用 EXE 默认栈大小), 不再需要 4MB + STACK_SIZE_PARAM_IS_A_RESERVATION。
+    //
+    // 仍用 _beginthreadex 而非裸 CreateThread: worker 大量使用 CRT (std::string / unordered_map /
+    // swprintf / std::ranges::sort / 异常), 应走 CRT 线程入口以正确初始化/清理 per-thread 状态;
+    // 裸 CreateThread 跑 CRT 在极端低内存下有终止进程的风险。
+    uintptr_t raw = _beginthreadex(nullptr, 0,
+                                   ProcessFile_Worker, out.get(),
+                                   0, nullptr);
+    if (raw == 0) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
-    CloseHandle(hThread);  // 我们用 PostMessage 同步, 不需要 join
+    // v0.1.3.3: 句柄不再立即 CloseHandle —— 保留在 g_hWorker 供 join (下次 Submit 开头 /
+    // WM_DESTROY 兜底), 保证退出前 worker 完整走完, 杜绝 ExitProcess 截杀尾声线程。
+    g_hWorker = reinterpret_cast<HANDLE>(raw);
     out.release();         // worker 接管所有权, 完成时主线程在 WM_APP_PROCESS_DONE 里 delete
     return true;
 }
@@ -1049,50 +1056,49 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
 // 主线程消费 worker 结果. 必须在 WM_APP_PROCESS_DONE 里调用
 void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
     if (out->ok) {
-        // 把结果搬到全局 statsAgent/statsWEngine (主线程独占, 不需要锁)
-        statsAgent   = out->statsAgent;
-        statsWEngine = out->statsWEngine;
+        // 把结果搬到全局 statsAgent/statsWEngine/statsStandard (主线程独占,不需要锁)
+        statsAgent    = out->statsAgent;
+        statsWEngine  = out->statsWEngine;
+        statsStandard = out->statsStandard;
         SetWindowTextW(hOutEdit, out->outMsg.c_str());
         RebuildChartCache(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
     } else {
         SetWindowTextW(hOutEdit,
-            out->errMsg.empty()
-              ? L"处理失败，请检查文件格式"
-              : out->errMsg.c_str());
+            out->errMsg.empty() ? L"处理失败,请检查文件格式" : out->errMsg.c_str());
     }
     delete out;
     InterlockedExchange(&g_processing, 0);  // 释放双开锁
 }
-// -------------------------------------------------------
-// 图形渲染
-// -------------------------------------------------------
 
+// -------------------------------------------------------
+// 图形渲染 —— 曲线坐标点用栈数组, 避免在绘图热路径里反复 new 小对象。
+// -------------------------------------------------------
 // ---------------------------------------------------------
 // [ECDF (经验累积分布函数) 图]
 //
 // 设计:
 //   - 离散阶梯线: ECDF(x) = (Σ_{k<=x} freq[k]) / total
-//   - 同时画综合 (蓝) 和 UP (红) 两条经验 ECDF + 两条理论 CDF (虚线)
-//   - 标记 KS 偏离最大处的 D 值竖线 (与 ks_d_all 一致, 用户可视化检验)
-//   - 右删失处理: ECDF 终点不到 1.0 (因为 censored_pity 表示当前未出货)
+//   - 同时画综合(蓝)和 UP(红)两条经验 ECDF + 两条理论 CDF(虚线)
+//   - 标记 KS 偏离最大处的 D 值竖线(与 ks_d_all 一致,用户可视化检验)
+//   - 右删失处理: ECDF 终点不到 1.0(因为 censored_pity 表示当前未出货)
 //
-// 与终末地的差异:
-//   - 数组容量改为 200 (代理人 UP 池 CDF 长度可达 180+1)
-//   - 不再有 ecdf_up_step_size 参数: 绝区零没有"10 抽一组"的离散判定
-//     (终末地武器池有, 因为它是十连绑定), 所有点都是单抽粒度, stepSize 恒为 1
-//
-// 为什么用 ECDF 而非 KDE:
-//   抽卡数据是离散整数 pity, 样本量极小 (n ~10), KDE 的高斯核平滑会引入
-//   虚假的连续性 + 平滑过的尾部, ECDF 直接体现真实数据点的位置, 更诚实。
+// 为什么从 KDE 切换到 ECDF:
+//   抽卡数据是离散整数 pity,样本量极小(n ~10),KDE 的高斯核平滑会引入虚假
+//   连续性,带宽选择对结果影响巨大,在 x=1 等边界处会产生人造凸起。
+//   ECDF 是离散数据的标准非参数显示,无任何参数选择,与 KS 检验直接对应。
 // ---------------------------------------------------------
 void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
               const std::array<int, 200>& freq_all, const std::array<int, 200>& freq_up,
               int count_all, int count_up,
               [[maybe_unused]] int censored_all, [[maybe_unused]] int censored_up,
-              const double* theory_cdf_all, int theory_cdf_all_len,
-              const double* theory_cdf_up,  int theory_cdf_up_len,
-              const std::wstring& title, int limit_base) {
+              std::span<const double> theory_cdf_all,
+              std::span<const double> theory_cdf_up,
+              const std::wstring& title, int limit_base,
+              int ecdf_up_step_size = 1,
+              bool show_up = true) {
+    // show_up=false (常驻频段): 仅隐藏 UP 图例文字。UP 曲线本身因
+    // count_up=0 + 空理论 CDF (span 长度 0) 自然消失, 不需要额外分支。
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 252, 253, 255));
     g.FillRectangle(&bgBrush, rect);
     Gdiplus::FontFamily fontFamily(L"Microsoft YaHei");
@@ -1110,10 +1116,17 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         }
     }
     // v0.1.2.1: 无出金时不再直接 return, 而是继续渲染坐标轴和理论 CDF (蓝/红虚线),
-    // 让用户能看到"这个池子的理论分布长什么样"的参考曲线.
-    // 经验 ECDF 阶梯线和 KS 标记本身有 total==0 守卫, 会自然跳过.
+    // 让用户能看到"这个池子的理论分布长什么样"的参考曲线。原版直接 "暂无出金数据"
+    // 一句话占满图框, 新池子用户体验差 (查不到任何信息).
+    // 跳过的只是: 经验 ECDF 阶梯线 (drawEmpiricalECDF)、KS 偏离度标记。
     max_x = ((max_x / 10) + 1) * 10;
+    // 钳到 freq 数组合法上界 199 (容量 200, Calculate 守 slot<200)。
+    // 事件落在 190..199 时上一行取整会把 max_x 推到 200, 下游 freq[k] (k<=max_x)
+    // 越界读。ZZZ 各池间隔理论上 <=180 (代理人 UP 大保底), >180 只可能来自异常
+    // 数据, 此钳制是纯防御 (MRL 同款见 DrawMRL)。
+    if (max_x > 199) max_x = 199;
 
+    // 网格 + 坐标轴
     Gdiplus::Pen gridPen(Gdiplus::Color(255, 230, 230, 230), DPIScaleF(1.0f));
     Gdiplus::Pen axisPen(Gdiplus::Color(255, 80, 80, 80),  DPIScaleF(1.0f));
     float plotX = (float)rect.X + DPIScaleF(50.0f);
@@ -1134,6 +1147,7 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     Gdiplus::Font tickFont(&fontFamily, DPIScaleF(11.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush tickBrush(Gdiplus::Color(255, 120, 120, 120));
 
+    // Y 轴 0/25/50/75/100% 网格
     for (int i = 0; i <= 4; ++i) {
         double y_val = (double)i / 4.0;
         float py = plotY + plotH - (float)y_val * plotH;
@@ -1143,6 +1157,7 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         float labelW = (float)wcslen(y_label) * DPIScaleF(5.5f) + DPIScaleF(8.0f);
         g.DrawString(y_label, -1, &tickFont, Gdiplus::PointF(plotX - labelW, py - DPIScaleF(6.0f)), &tickBrush);
     }
+    // X 轴刻度
     int step = (max_x > 140) ? 20 : 10;
     for (int x = 0; x <= max_x; x += step) {
         float px = plotX + (float)x / (float)max_x * plotW;
@@ -1155,22 +1170,37 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
 
     // 画理论 CDF (虚线).
     //
-    // 自动跳跃检测: 用状态机决定折线 vs 阶梯
-    //   - 折线模式: Δ_k / Δ_{k-1} > JUMP_THRESHOLD (=5) → 进入阶梯模式
-    //   - 阶梯模式: Δ 持续上升 (Δ_k > Δ_{k-1}) → 保持阶梯; 否则退出回到折线
-    // 这样能正确表达"软保底响应到峰值"这一持续陡升过程, 而不只是把
-    // 触发跳跃的那一个点画成阶梯。
+    // 形态选择:
+    //   stepSize == 1 (角色 / 综合武器): 折线连相邻整数点
+    //     —— 角色每抽都是真实采样点, 折线是平缓上升的曲线, dash 平滑展开。
+    //     —— 旧版 stepSize==1 强制阶梯 (水平+垂直) 在大量微小 90° 角点上让
+    //        dash pattern 反复重启, 视觉糊成"蛆状"小钩 —— 改成纯折线根除。
+    //   stepSize > 1  (武器 UP): 真阶梯, 水平 (stepSize-1) 抽 + 垂直跳跃
+    //     —— 反映"10 抽一组判定"机制: 拨内 CDF 真的不变, 阶梯是机制必然
     //
-    // 绝区零触发场景 (与终末地同样的机理):
-    //   代理人池: k=74 hazard 跳跃 (0.066/0.006 = 11x), 软保底响应区会触发阶梯
-    //   音擎池:   k=65 hazard 跳跃 (0.08/0.01 = 8x), 同上
-    //   两个池的跳跃比例都远大于阈值 5, 与终末地角色池软保底机理一致。
+    // 自动跳跃检测 (v0.1.1):
+    // 在 stepSize=1 的折线模式下用状态机:
+    //   - 折线模式: Δ_k / Δ_{k-1} > JUMP_THRESHOLD (=5) → 进入阶梯模式
+    //   - 阶梯模式: Δ 持续上升 (Δ_k > Δ_{k-1}) → 保持阶梯; 否则退出折线
+    // 这样能正确表达"软保底响应到峰值"这一持续陡升过程, 而不只是把
+    // 触发跳跃的那一个点画成阶梯。例如角色 UP CDF 在 k=66 hazard 跳跃,
+    // 但 CDF 增量峰值出现在 k=69 (因为 D[s] 迭代积分需要几抽反应):
+    //   k=66 (Δ=0.018, 进入阶梯) → k=67 (0.031) → k=68 (0.040) → k=69 (0.045) →
+    //   k=70 (0.045 ≤ 0.045 退出阶梯) → 后续平滑衰减
+    // 自动覆盖以下场景, 不需要硬编码具体 k:
+    //   - 角色综合 k=30 (单点跳跃: 30 抽合并 11 次判定)
+    //   - 角色综合 k=66~69 (软保底响应)
+    //   - 角色 UP   k=66~69 (软保底响应)
+    //   - 角色 UP   k=120 (硬保底)
+    // 武器综合 k=31 比值仅 2.86, 不触发, 保持平滑折线 (软保底渐进展开是真实形态)。
     //
     // 画法: 用 GraphicsPath 攒整条路径再一次性 stroke,
     //       dash pattern 沿连续路径走, 跨拐角不重启;
-    //       LineJoin=Round 让拐角圆滑过渡, 缓解 dash 实部压在拐角的视觉错乱。
-    auto drawTheoryCDF = [&](const double* cdf, int cdf_len, Gdiplus::Color color) {
-        if (!cdf || cdf_len < 2) return;
+    //       LineJoin=Round 让拐角圆滑过渡, 缓解 dash 实部压在 90° 角的视觉错乱。
+    auto drawTheoryCDF = [&](std::span<const double> cdf,
+                             int stepSize, Gdiplus::Color color) {
+        const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
+        if (cdf_len < 2) return;
         Gdiplus::Pen pen(color, DPIScaleF(1.5f));
         Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
         pen.SetDashPattern(dash, 2);
@@ -1178,9 +1208,12 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         int upper = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
         if (upper < 1) return;
         // v0.1.2.2: 截掉两类"伪末端":
-        //   1) 已饱和段: cdf[k] >= 1-eps, 之后全等于 1.0 (硬保底后的哨兵区),
-        //      画到饱和点就停, 否则末端会冒出一段无意义的水平虚线.
-        //   2) 未填充哨兵段: cdf[k] < cdf[k-1] (单调性破坏), 立即截断.
+        //   1) 已饱和段: 找到第一个 cdf[k] >= 1-eps 的 k_sat, 之后所有 cdf 都等于 1.0
+        //      (硬保底之后的延伸 + char_up 122 个槽里 cdf[120]=cdf[121]=1 的哨兵区);
+        //      画到 k_sat 就停, 否则末端会冒出一段 1→1 水平虚线 (即"垂直阶梯顶端向右
+        //      拐弯"的视觉 bug, 由 step mode 退出时画的水平退出线引起).
+        //   2) 未填充哨兵段 (纯防御): 若 cdf 末端未填充 (=0), 画上去会从高值跳到 0,
+        //      产生倒挂. 检测到 cdf[k] < cdf[k-1] (单调性破坏) 也立即停.
         constexpr double EPS_SAT = 1e-6;
         int upper_eff = upper;
         for (int k = 1; k <= upper; ++k) {
@@ -1191,47 +1224,67 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         Gdiplus::GraphicsPath path;
         auto p0 = getPt(0, cdf[0]);
         Gdiplus::PointF prev = p0;
-        constexpr double JUMP_THRESHOLD = 5.0;
-        constexpr double MIN_PREV_DELTA = 1e-6;
-        bool inStepMode = false;
-        for (int k = 1; k <= upper_eff; ++k) {
-            double curDelta  = cdf[k] - cdf[k-1];
-            double prevDelta = (k >= 2) ? cdf[k-1] - cdf[k-2] : 0.0;
-            bool drawAsStep;
-            if (inStepMode) {
-                if (curDelta > prevDelta && prevDelta > MIN_PREV_DELTA) {
-                    drawAsStep = true;
+        if (stepSize == 1) {
+            constexpr double JUMP_THRESHOLD = 5.0;
+            constexpr double MIN_PREV_DELTA = 1e-6;
+            bool inStepMode = false;
+            for (int k = 1; k <= upper_eff; ++k) {
+                double curDelta  = cdf[k] - cdf[k-1];
+                double prevDelta = (k >= 2) ? cdf[k-1] - cdf[k-2] : 0.0;
+                bool drawAsStep;
+                if (inStepMode) {
+                    // 阶梯模式: Δ 持续上升就保持, 否则退出
+                    if (curDelta > prevDelta && prevDelta > MIN_PREV_DELTA) {
+                        drawAsStep = true;
+                    } else {
+                        inStepMode = false;
+                        drawAsStep = false;
+                    }
                 } else {
-                    inStepMode = false;
-                    drawAsStep = false;
+                    // 折线模式: 检测进入条件
+                    if (prevDelta > MIN_PREV_DELTA
+                        && curDelta / prevDelta > JUMP_THRESHOLD) {
+                        inStepMode = true;
+                        drawAsStep = true;
+                    } else {
+                        drawAsStep = false;
+                    }
                 }
-            } else {
-                if (prevDelta > MIN_PREV_DELTA
-                    && curDelta / prevDelta > JUMP_THRESHOLD) {
-                    inStepMode = true;
-                    drawAsStep = true;
+                if (drawAsStep) {
+                    auto pH = getPt(k, cdf[k - 1]);
+                    auto pV = getPt(k, cdf[k]);
+                    path.AddLine(prev, pH);
+                    path.AddLine(pH, pV);
+                    prev = pV;
                 } else {
-                    drawAsStep = false;
+                    auto p = getPt(k, cdf[k]);
+                    path.AddLine(prev, p);
+                    prev = p;
                 }
             }
-            if (drawAsStep) {
-                auto pH = getPt(k, cdf[k - 1]);
-                auto pV = getPt(k, cdf[k]);
+        } else {
+            // 武器: 阶梯, 水平段 + 垂直段
+            int k = stepSize;
+            while (k <= upper_eff) {
+                auto pH = getPt(k, cdf[k - stepSize]);  // 水平到拐角
+                auto pV = getPt(k, cdf[k]);              // 垂直跳跃
                 path.AddLine(prev, pH);
                 path.AddLine(pH, pV);
                 prev = pV;
-            } else {
-                auto p = getPt(k, cdf[k]);
-                path.AddLine(prev, p);
-                prev = p;
+                k += stepSize;
+            }
+            // 末段补水平到 upper_eff (如果没走到)
+            if (k - stepSize < upper_eff) {
+                auto pEnd = getPt(upper_eff, cdf[k - stepSize]);
+                path.AddLine(prev, pEnd);
             }
         }
         g.DrawPath(&pen, &path);
     };
 
     // 画经验 ECDF (实阶梯线).
-    // 注: 删失观测 (用户当前还在垫的 cur_pity) 不画在 ECDF 上 ——
-    // 因为它还没事件化, 强行画一个标记反而误导 (会落在 ECDF 终点 y=100% 处)。
+    // 注: 删失观测(用户当前还在垫的 cur_pity)不画在 ECDF 上 ——
+    // 因为它还没事件化, 强行画一个标记反而误导(会落在 ECDF 终点 y=100% 处)。
     // MRL 图已经精确显示"已垫 X 抽 / 预期还需 Y 抽", 这里不重复。
     auto drawEmpiricalECDF = [&](const std::array<int, 200>& freq, int total,
                                   Gdiplus::Color color) {
@@ -1252,12 +1305,12 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         g.DrawLine(&pen, prev_pt.X, prev_pt.Y, end_pt.X, end_pt.Y);
     };
 
-    drawTheoryCDF(theory_cdf_all, theory_cdf_all_len, Gdiplus::Color(180, 65, 140, 240));
-    drawTheoryCDF(theory_cdf_up,  theory_cdf_up_len,  Gdiplus::Color(180, 240, 80, 80));
+    drawTheoryCDF(theory_cdf_all, 1,                 Gdiplus::Color(180, 65, 140, 240));
+    drawTheoryCDF(theory_cdf_up,  ecdf_up_step_size, Gdiplus::Color(180, 240, 80, 80));
     drawEmpiricalECDF(freq_all, count_all, Gdiplus::Color(255, 65, 140, 240));
     drawEmpiricalECDF(freq_up,  count_up,  Gdiplus::Color(255, 240, 80, 80));
 
-    // KS 标记 (双色, 综合蓝色标签左上 / UP 红色标签右下)
+    // KS 标记 (v0.1.1.1: 双色, 综合蓝色标签左上 / UP 红色标签右下)
     //
     // 标签布局策略:
     //   - 蓝色 (综合): 标签贴在 KS 虚线的左上方 (anchor 右下)
@@ -1268,13 +1321,16 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // 标签自带白色描边 (4 偏移方向先画白色底字再叠主文本), 在彩色实线上的可读性更好。
     enum class KSLabelAnchor { LeftTop, RightBottom };
     auto drawKSMarker = [&](const std::array<int, 200>& freq, int total,
-                            const double* cdf, int cdf_len,
+                            std::span<const double> cdf,
                             BYTE r, BYTE gC, BYTE b,
                             KSLabelAnchor anchor) {
-        if (total == 0 || !cdf || cdf_len < 2) return;
-        // v0.1.2.2/4: 同 drawTheoryCDF / computeTheoryMRL, 加 upper_eff 截断避免:
-        //   - 未填充哨兵段被误判为最大偏离点 (|cum - 0| ≈ 1)
+        const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
+        if (total == 0 || cdf_len < 2) return;
+        // v0.1.2.4: 同 drawTheoryCDF / computeTheoryMRL, 加 upper_eff 截断避免:
+        //   - 未填充哨兵段 (cdf[k]=0) 让 |cum - 0| ≈ 1, 误判为最大偏离点 (纯防御)
         //   - 饱和段 (cdf[k]==1 after hard pity) 上做无意义的比较
+        // 注: 此截断在 v0.1.2.2 已加到 drawTheoryCDF 和 computeTheoryMRL, 但当时漏掉
+        // drawKSMarker, 直到 v0.1.2.4 才补齐.
         constexpr double EPS_SAT = 1e-6;
         int upper_scan = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
         int upper_eff = upper_scan;
@@ -1305,18 +1361,22 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         swprintf(lbl, 32, L"KS D=%.3f", max_d);
         float midY = (p_emp.Y + p_th.Y) * 0.5f;
 
+        // 测量文字宽度,根据 anchor 计算左上角坐标
         Gdiplus::RectF box;
         g.MeasureString(lbl, -1, &tickFont, Gdiplus::PointF(0, 0), &box);
 
         float tx, ty;
         if (anchor == KSLabelAnchor::LeftTop) {
+            // 蓝色: 标签贴虚线左上 (文字右下角对齐到虚线左上)
             tx = p_emp.X - DPIScaleF(4.0f) - box.Width;
             ty = midY - DPIScaleF(2.0f) - box.Height;
         } else {
+            // 红色: 标签贴虚线右下 (文字左上角对齐到虚线右下)
             tx = p_emp.X + DPIScaleF(4.0f);
             ty = midY + DPIScaleF(2.0f);
         }
 
+        // 白色描边
         Gdiplus::SolidBrush whiteBr(Gdiplus::Color(255, 252, 253, 255));
         for (int dx = -1; dx <= 1; dx += 2) {
             for (int dy = -1; dy <= 1; dy += 2) {
@@ -1325,43 +1385,49 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                              &whiteBr);
             }
         }
+        // 主文本 (与对应 ECDF 实线同色)
         Gdiplus::SolidBrush mainBr(Gdiplus::Color(255, r, gC, b));
         g.DrawString(lbl, -1, &tickFont, Gdiplus::PointF(tx, ty), &mainBr);
     };
-    drawKSMarker(freq_all, count_all, theory_cdf_all, theory_cdf_all_len,
+    // 蓝色 (综合): 左上
+    drawKSMarker(freq_all, count_all, theory_cdf_all,
                  65, 140, 240, KSLabelAnchor::LeftTop);
-    drawKSMarker(freq_up, count_up, theory_cdf_up, theory_cdf_up_len,
+    // 红色 (UP): 右下
+    drawKSMarker(freq_up, count_up, theory_cdf_up,
                  240, 80, 80, KSLabelAnchor::RightBottom);
 
     // 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论 CDF 虚线)
-    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行, 从右向左排,
-    // 这样图例完全位于标题区 (rect.Y+12 行), 不会下沉到绘图区 (rect.Y+40 起)。
-    // 旧版图例垂直堆叠 3 行, 最下面一项会落进绘图区与曲线重叠。
+    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行,从右向左排,
+    // 这样图例完全位于标题区(rect.Y+12 行),不会下沉到绘图区(rect.Y+40 起)。
+    // 旧版图例垂直堆叠 3 行,最下面一项会落进绘图区与曲线重叠。
     Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
     Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
 
-    const wchar_t* legAll  = L"综合 S 级 ECDF";
+    // 三个图例项的文字(色块在前,文字在后)
+    const wchar_t* legAll  = L"综合S级 ECDF";
     const wchar_t* legUp   = L"当期限定 UP ECDF";
     const wchar_t* legThy  = L"理论 CDF (综合)";
 
-    // 测量文字宽度, 精确从右排 —— 不能用固定常量, 因为不同字体/DPI 下宽度不同
+    // 测量文字宽度,精确从右排 —— 不能用固定常量,因为不同字体/DPI 下宽度不同
     auto measureW = [&](const wchar_t* s) -> float {
         Gdiplus::RectF box;
         g.MeasureString(s, -1, &legendFont, Gdiplus::PointF(0, 0), &box);
         return box.Width;
     };
-    const float swatchW    = DPIScaleF(14.0f);
-    const float swatchGap  = DPIScaleF(6.0f);
-    const float entryGap   = DPIScaleF(16.0f);
+    const float swatchW    = DPIScaleF(14.0f);  // 实线/虚线色块宽度
+    const float swatchGap  = DPIScaleF(6.0f);   // 色块到文字间距
+    const float entryGap   = DPIScaleF(16.0f);  // 项与项之间间距
     const float legendY    = (float)rect.Y + DPIScaleF(12.0f);
-    const float swatchYOff = DPIScaleF(8.0f);
+    const float swatchYOff = DPIScaleF(8.0f);   // 色块在图例行内的垂直居中偏移
 
+    // 从右往左:Theory(虚线) → UP → All
     float wAll  = measureW(legAll);
     float wUp   = measureW(legUp);
     float wThy  = measureW(legThy);
     float xRight = (float)rect.X + (float)rect.Width - DPIScaleF(12.0f);
 
+    // 第 3 项: 理论 CDF (虚线,最右)
     float xThyText = xRight - wThy;
     float xThySw   = xThyText - swatchGap - swatchW;
     {
@@ -1374,13 +1440,18 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     g.DrawString(legThy, -1, &legendFont,
                  Gdiplus::PointF(xThyText, legendY), &textBrush);
 
-    float xUpText = xThySw - entryGap - wUp;
-    float xUpSw   = xUpText - swatchGap - swatchW;
-    g.FillRectangle(&redBr, xUpSw, legendY + swatchYOff - DPIScaleF(1.5f),
-                    swatchW, DPIScaleF(3.0f));
-    g.DrawString(legUp, -1, &legendFont,
-                 Gdiplus::PointF(xUpText, legendY), &textBrush);
+    // 第 2 项: UP ECDF (常驻频段 show_up=false 时整项跳过, 综合项左移补位)
+    float xUpSw = xThySw;
+    if (show_up) {
+        float xUpText = xThySw - entryGap - wUp;
+        xUpSw = xUpText - swatchGap - swatchW;
+        g.FillRectangle(&redBr, xUpSw, legendY + swatchYOff - DPIScaleF(1.5f),
+                        swatchW, DPIScaleF(3.0f));
+        g.DrawString(legUp, -1, &legendFont,
+                     Gdiplus::PointF(xUpText, legendY), &textBrush);
+    }
 
+    // 第 1 项: 综合 ECDF
     float xAllText = xUpSw - entryGap - wAll;
     float xAllSw   = xAllText - swatchGap - swatchW;
     g.FillRectangle(&blueBr, xAllSw, legendY + swatchYOff - DPIScaleF(1.5f),
@@ -1388,7 +1459,8 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     g.DrawString(legAll, -1, &legendFont,
                  Gdiplus::PointF(xAllText, legendY), &textBrush);
 
-    // 无出金时, 在绘图区中央叠加灰色提示 (v0.1.2.1, 理论曲线仍可见)
+    // 无出金时, 在绘图区中央叠加灰色提示 (v0.1.2.1)
+    // 理论 CDF 已经画了, 此提示仅说明"经验数据为空", 不阻塞其它内容显示
     if (!hasData) {
         Gdiplus::Font hintFont(&fontFamily, DPIScaleF(13.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
         Gdiplus::SolidBrush hintBrush(Gdiplus::Color(200, 130, 130, 130));
@@ -1405,15 +1477,15 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
 // ---------------------------------------------------------
 // [MRL (Mean Residual Life) 图]
 //
-// MRL(t) = E[X - t | X > t] —— "已经垫了 t 抽, 还要再垫多少抽的期望"
+// MRL(t) = E[X - t | X > t] —— "已经垫了 t 抽,还要再垫多少抽的期望"
 //
 // 经验 MRL 计算 (从 freq 直方图):
 //   MRL_emp(t) = Σ_{k>t} (k-t)·freq[k] / Σ_{k>t} freq[k]
 //   分母 = 0 (即 t >= max_observed) 时 MRL 未定义
 //
 // 显示策略:
-//   - 实线: t 处至少有 2 个观测在分子里 (Σ_{k>t} freq[k] >= 2), 数值可靠
-//   - 半透明同色实线: 仅 1 个观测, 高方差区
+//   - 实线: t 处至少有 2 个观测在分子里 (Σ_{k>t} freq[k] >= 2),数值可靠
+//   - 半透明虚线: 仅 1 个观测,高方差区
 //   - 不画: 0 观测 (无意义)
 //   - 同时画理论 MRL (虚线): 基于理论 CDF 数值积分
 //   - 当前 censored_pity 位置画竖线 + "你在这里"标注 (用户决策视角的关键)
@@ -1423,10 +1495,15 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
              const std::array<int, 200>& freq_up,
              int count_all, int count_up,
              int censored_all, int censored_up,
-             const double* theory_cdf_all, int theory_cdf_all_len,
-             const double* theory_cdf_up,  int theory_cdf_up_len,
+             std::span<const double> theory_cdf_all,
+             std::span<const double> theory_cdf_up,
              const std::wstring& title, int limit_base,
-             int theory_all_cap = 0, int theory_up_cap = 0) {
+             int theory_all_cap = 0, int theory_up_cap = 0,
+             bool show_up = true) {
+    // show_up=false (常驻频段): 仅隐藏 UP 图例文字, UP 曲线/标注因
+    // count_up=0 + 空理论 CDF 自然消失。
+    //   各池 UP CDF 在 X 轴末端 (大保底处) 已饱和 (>1 - 1e-6), upper_eff 截在
+    //   饱和点, 此时 (1 - cdf[upper_eff]) ≈ 0, 即使传 0 也无影响.
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 252, 253, 255));
     g.FillRectangle(&bgBrush, rect);
     Gdiplus::FontFamily fontFamily(L"Microsoft YaHei");
@@ -1441,9 +1518,14 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     for (int i = 1; i < 200; i++) {
         if (freq_all[i] > 0 || freq_up[i] > 0) if (i > max_x) max_x = i;
     }
-    // v0.1.2.1: 无出金时不直接 return, 继续渲染坐标轴 + 理论 MRL 虚线,
-    // 末尾叠加灰色提示. 经验 MRL 线本身有 surv==0 守卫, 会自然跳过.
+    // v0.1.2.1: 无出金时不再直接 return, 继续渲染理论 MRL 虚线作参考。
+    // 经验 MRL 自然为空 (computeEmpiricalMRL 内部已防御 total==0), KS / "你在这里" 标记
+    // 也都依赖出金数据, 缺失时跳过。提示在最后叠加灰色字。
     max_x = ((max_x / 10) + 1) * 10;
+    // 同 DrawECDF 的 199 钳制 —— 此处更严重: computeEmpiricalMRL 内
+    // surv[t]/mrl[t] 在 t=200 是【栈数组越界写】(ASan 实测 stack-buffer-overflow),
+    // 末尾 max_y 循环与 mrl_*[t] 读同样越界。触发条件: 任一 freq 事件落在 [190,199]。
+    if (max_x > 199) max_x = 199;
 
     // ---- 计算经验 MRL 序列 (并记录每个 t 处的 surviving 计数) ----
     auto computeEmpiricalMRL = [&](const std::array<int, 200>& freq, int total)
@@ -1454,6 +1536,8 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         // 后缀和: 从最大 max_x 往回累加
         long long suf_count = 0, suf_weighted = 0;
         for (int t = max_x; t >= 0; --t) {
+            // 在循环开始时 suf_count = Σ_{k>t} freq[k], 注意 k 从 t+1 开始
+            // 我们要在每一步先用当前累积值算 MRL(t),再把 freq[t] 累加进去给下一轮 t-1 用
             surv[t] = (int)suf_count;
             if (suf_count >= 1) {
                 mrl[t] = (double)(suf_weighted - (long long)t * suf_count) / (double)suf_count;
@@ -1469,13 +1553,15 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     auto mrl_all = computeEmpiricalMRL(freq_all, count_all);
     auto mrl_up  = computeEmpiricalMRL(freq_up,  count_up);
 
-    auto computeTheoryMRL = [&](const double* cdf, int cdf_len) {
+    // ---- 计算理论 MRL (基于理论 CDF, 可选长尾解析延伸) ----
+    auto computeTheoryMRL = [&](std::span<const double> cdf, double tail_mean_excess = 0.0) {
         std::array<double, 200> tmrl{}; tmrl.fill(-1.0);
-        if (!cdf || cdf_len < 2) return tmrl;
-        int upper = cdf_len - 1;
+        const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
+        if (cdf_len < 2) return tmrl;
+        int upper = cdf_len - 1;  // CDF 最大有效索引
         // v0.1.2.2: 与 drawTheoryCDF 同样的 upper_eff 截断逻辑, 避免:
         //   1) 饱和段 (cdf[k]==1 after hard pity): 不必再算
-        //   2) 未填充末端: 算 pdf[k]=cdf[k]-cdf[k-1] 会出异常值
+        //   2) 未填充末端 (cdf[k]=0, 纯防御): 算 pdf[k]=cdf[k]-cdf[k-1] 会出负值
         constexpr double EPS_SAT = 1e-6;
         int upper_eff = upper;
         for (int k = 1; k <= upper; ++k) {
@@ -1483,6 +1569,17 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
             if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
         }
         if (upper_eff < 1) return tmrl;
+        // 长尾点质量参数 (v0.1.2.4):
+        //   tail_mass     = 1 - cdf[upper_eff]
+        //   tail_position = upper_eff + tail_mean_excess
+        //   仅当 tail_mean_excess > 0 且 tail_mass > 1e-9 时才追加。
+        //   ZZZ 各池 CDF 都自然饱和到 1.0 (大保底封顶), 调用方不再传该参数
+        //   (默认 0), 此机制保留作通用能力 (原终末地辉光池长尾延伸的遗产)。
+        double tail_mass     = 1.0 - cdf[upper_eff];
+        double tail_position = (double)upper_eff + tail_mean_excess;
+        bool   has_tail      = (tail_mean_excess > 0.0) && (tail_mass > 1e-9);
+        // 从 PDF: pdf[k] = cdf[k] - cdf[k-1], for k=1..upper_eff
+        // MRL(t) = [Σ_{k>t} (k-t) · pdf[k] + (tail_position-t) · tail_mass] / (1 - cdf[t])
         for (int t = 0; t <= upper_eff - 1 && t <= max_x; ++t) {
             double surv_t = 1.0 - cdf[t];
             if (surv_t < 1e-9) break;
@@ -1491,13 +1588,17 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                 double pdf_k = cdf[k] - cdf[k-1];
                 num += (double)(k - t) * pdf_k;
             }
+            if (has_tail) {
+                num += (tail_position - (double)t) * tail_mass;
+            }
             tmrl[t] = num / surv_t;
         }
         return tmrl;
     };
-    auto theory_mrl_all = computeTheoryMRL(theory_cdf_all, theory_cdf_all_len);
-    auto theory_mrl_up  = computeTheoryMRL(theory_cdf_up,  theory_cdf_up_len);
+    auto theory_mrl_all = computeTheoryMRL(theory_cdf_all);
+    auto theory_mrl_up  = computeTheoryMRL(theory_cdf_up);
 
+    // ---- Y 轴范围: 取所有 MRL 值的最大值 ----
     double max_y = 1.0;
     for (int t = 0; t <= max_x; ++t) {
         if (mrl_all.first[t] > max_y) max_y = mrl_all.first[t];
@@ -1505,7 +1606,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         if (theory_mrl_all[t] > max_y) max_y = theory_mrl_all[t];
         if (theory_mrl_up[t]  > max_y) max_y = theory_mrl_up[t];
     }
-    // 取整到 10 的倍数, 留 10% 顶部空间
+    // 取整到 10 的倍数,留 10% 顶部空间
     max_y = std::ceil(max_y * 1.1 / 10.0) * 10.0;
     if (max_y < 10) max_y = 10;
 
@@ -1530,6 +1631,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     Gdiplus::Font tickFont(&fontFamily, DPIScaleF(11.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush tickBrush(Gdiplus::Color(255, 120, 120, 120));
 
+    // Y 轴刻度 (单位: 抽)
     for (int i = 0; i <= 4; ++i) {
         double y_val = max_y * (double)i / 4.0;
         float py = plotY + plotH - (float)i / 4.0f * plotH;
@@ -1539,6 +1641,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         float labelW = (float)wcslen(y_label) * DPIScaleF(5.5f) + DPIScaleF(8.0f);
         g.DrawString(y_label, -1, &tickFont, Gdiplus::PointF(plotX - labelW, py - DPIScaleF(6.0f)), &tickBrush);
     }
+    // X 轴刻度
     int step = (max_x > 140) ? 20 : 10;
     for (int x = 0; x <= max_x; x += step) {
         float px = plotX + (float)x / (float)max_x * plotW;
@@ -1551,7 +1654,10 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
 
     // ---- 画理论 MRL (虚线) ----
     // 用 GraphicsPath 一次性 stroke, dash pattern 沿连续路径走。
-    // LineJoin=Round 让拐角圆滑, 缓解 dash 实部压在拐角的视觉错乱。
+    // 注: 实际 theoryMRL 在 [0, cap] 区间是连续单调的(不会出现 -1 中段断开),
+    // 所以单一 Path 一次构建即可,无需处理多段。
+    // LineJoin=Round 让拐角圆滑 (武器 UP MRL 是锯齿状, 每 10 抽内斜率 -1 ,
+    // 拐角处线段方向变化, Round 缓解 dash 实部压在拐角的视觉错乱)。
     auto drawTheoryMRL = [&](const std::array<double, 200>& tmrl, int cap, Gdiplus::Color color) {
         Gdiplus::Pen pen(color, DPIScaleF(1.5f));
         Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
@@ -1574,7 +1680,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
 
     // ---- 画经验 MRL ----
     //
-    // 视觉编码:
+    // 视觉编码 (v0.1.1):
     //   surv >= 2: 满色实线 2.5pt   ← 多个独立样本支撑, 统计可靠
     //   surv == 1: 半透明同色实线 1.8pt (alpha=115/255 ≈ 0.45)  ← 高方差区
     //
@@ -1594,6 +1700,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         Gdiplus::Pen thinPen (Gdiplus::Color(115, r, gC, b), DPIScaleF(1.8f));
         thinPen.SetLineJoin(Gdiplus::LineJoinRound);
 
+        // 累积:满色段进 thickPath, 半透明段进 thinPath (每段都 StartFigure 隔开)
         Gdiplus::GraphicsPath thickPath, thinPath;
         Gdiplus::PointF prev; bool has_prev = false; bool prev_thick = true;
         for (int t = 0; t <= max_x; ++t) {
@@ -1621,12 +1728,12 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // ---- "你在这里" 竖线 (当前 censored_pity 位置) ----
     // 关键设计:
     //   - 综合 (蓝): 优先用综合理论 MRL, 否则降级到经验 MRL
-    //   - UP   (红): 同样优先用 UP 理论 MRL, 否则降级到经验 MRL。
-    //                有了精确的 UP 理论曲线后, 即使本次抽卡数据稀疏 / 全在
-    //                同一 censored 区段内, 标注线也能给出可靠参考。
+    //   - UP (红):   v0.1.1 起也优先用 UP 理论 MRL (新增 g_cdf_*_up 后),
+    //                否则降级到经验 MRL。有了精确的 UP 理论曲线后, 即使本次抽卡
+    //                数据稀疏 / 全在同一 censored 区段内, 标注线也能给出可靠参考。
     //   - 虚线在 X 位置画出, 但标签固定在 plot 区域右上角竖排堆叠。
-    //     避免: 标签贴虚线时碰到 X=1 这种边界情况会被裁切, 也避免红蓝标签
-    //     互相重叠 (例如两个 censored 数值接近时)。
+    //     避免: 标签贴虚线时碰到 X=1 这种边界情况会被裁切, 也避免红蓝标签互相重叠
+    //     (例如两个 censored 数值接近时旧逻辑会把两段文本叠在一起)。
     //     视觉对应: 标签自带颜色, 用户能看出"蓝色标签对应蓝色虚线"。
 
     // (1) 先画虚线, 同时收集要展示的 (text, color) 条目
@@ -1644,25 +1751,27 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                                    BYTE r, BYTE gC, BYTE b) {
         if (censored <= 0 || censored > max_x) return;
         double y_value = -1.0;
+        // 1. 优先 theory MRL (综合和 UP 都有)
         if (censored < (int)tmrl.size() && tmrl[censored] > 0
             && (theory_cap == 0 || censored <= theory_cap)) {
             y_value = tmrl[censored];
         }
+        // 2. 降级经验 MRL
         if (y_value <= 0 && mrl_data.first[censored] > 0) {
             y_value = mrl_data.first[censored];
         }
         if (y_value <= 0) return;
         Gdiplus::Color color(255, r, gC, b);
         Gdiplus::Pen markPen(color, DPIScaleF(1.5f));
+        // dash pattern 与理论 CDF/MRL 保持一致 (4/3),让所有虚线视觉风格统一
         Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
         markPen.SetDashPattern(dash, 2);
         auto top = getPt(censored, y_value);
         g.DrawLine(&markPen, top.X, top.Y, top.X, plotY + plotH);
 
+        // 收集标签 (新格式: 单行, 用中点分隔; 右上角空间足够)
         wchar_t lbl[64];
-        // 已垫 X 抽 · 预期还需 Y.Y
-        swprintf(lbl, 64, L"已垫 %d 抽 · 预期还需 %.1f",
-                 censored, y_value);
+        swprintf(lbl, 64, L"已垫 %d 抽 · 预期还需 %.1f", censored, y_value);
         censoredLabels.push_back({ std::wstring(lbl), color });
     };
     resolveAndDrawLine(censored_all, mrl_all, theory_mrl_all, theory_all_cap, 65, 140, 240);
@@ -1670,8 +1779,9 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
 
     // (2) 在 plot 区域右上角内侧固定位置堆叠标签
     //     锚点右对齐, 行高约 14pt
+    //
     //     图例改为水平横排后只占 rect.Y+12 那一行 (与 macOS/iOS 一致),
-    //     不再下沉到绘图区, 所以标签可以从 plotY+6 紧贴绘图区顶部起步。
+    //     不再下沉到绘图区,所以标签可以从 plotY+6 紧贴绘图区顶部起步。
     if (!censoredLabels.empty()) {
         Gdiplus::StringFormat fmtRight;
         fmtRight.SetAlignment(Gdiplus::StringAlignmentFar);     // 水平右对齐
@@ -1703,13 +1813,13 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     }
 
     // ---- 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论值虚线) ----
-    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行, 从右向左排,
-    // 这样图例完全位于标题区, 不会下沉到绘图区。
+    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行,从右向左排,
+    // 这样图例完全位于标题区(rect.Y+12 行),不会下沉到绘图区(rect.Y+40 起)。
     Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
     Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
 
-    const wchar_t* legAll  = L"综合 S 级 剩余期望";
+    const wchar_t* legAll  = L"综合S级 剩余期望";
     const wchar_t* legUp   = L"当期限定 UP 剩余期望";
     const wchar_t* legThy  = L"理论值 (综合)";
 
@@ -1729,6 +1839,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     float wThy  = measureW(legThy);
     float xRight = (float)rect.X + (float)rect.Width - DPIScaleF(12.0f);
 
+    // 第 3 项: 理论值 (虚线,最右)
     float xThyText = xRight - wThy;
     float xThySw   = xThyText - swatchGap - swatchW;
     {
@@ -1741,13 +1852,18 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     g.DrawString(legThy, -1, &legendFont,
                  Gdiplus::PointF(xThyText, legendY), &textBrush);
 
-    float xUpText = xThySw - entryGap - wUp;
-    float xUpSw   = xUpText - swatchGap - swatchW;
-    g.FillRectangle(&redBr, xUpSw, legendY + swatchYOff - DPIScaleF(1.5f),
-                    swatchW, DPIScaleF(3.0f));
-    g.DrawString(legUp, -1, &legendFont,
-                 Gdiplus::PointF(xUpText, legendY), &textBrush);
+    // 第 2 项: UP 剩余期望 (常驻频段 show_up=false 时整项跳过, 综合项左移补位)
+    float xUpSw = xThySw;
+    if (show_up) {
+        float xUpText = xThySw - entryGap - wUp;
+        xUpSw = xUpText - swatchGap - swatchW;
+        g.FillRectangle(&redBr, xUpSw, legendY + swatchYOff - DPIScaleF(1.5f),
+                        swatchW, DPIScaleF(3.0f));
+        g.DrawString(legUp, -1, &legendFont,
+                     Gdiplus::PointF(xUpText, legendY), &textBrush);
+    }
 
+    // 第 1 项: 综合剩余期望
     float xAllText = xUpSw - entryGap - wAll;
     float xAllSw   = xAllText - swatchGap - swatchW;
     g.FillRectangle(&blueBr, xAllSw, legendY + swatchYOff - DPIScaleF(1.5f),
@@ -1755,7 +1871,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     g.DrawString(legAll, -1, &legendFont,
                  Gdiplus::PointF(xAllText, legendY), &textBrush);
 
-    // 无出金时, 在绘图区中央叠加灰色提示 (v0.1.2.1, 理论曲线仍可见)
+    // 无出金时, 在绘图区中央叠加灰色提示 (v0.1.2.1)
     if (!hasData) {
         Gdiplus::Font hintFont(&fontFamily, DPIScaleF(13.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
         Gdiplus::SolidBrush hintBrush(Gdiplus::Color(200, 130, 130, 130));
@@ -1778,6 +1894,15 @@ void RebuildChartCache(HWND hwnd) {
     HDC hdcMem = CreateCompatibleDC(hdcWnd);
     if (g_hChartBmp) DeleteObject(g_hChartBmp);
     g_hChartBmp = CreateCompatibleBitmap(hdcWnd, w, h);
+    // v0.1.3.3: DC / 位图创建失败 (极端低资源、超大窗口) 时早退。旧逻辑会把 NULL 选进
+    // hdcMem 继续画 (落在默认 1x1 位图上, 不崩但全部白画); WM_PAINT 端本就有空检查,
+    // 这里补对称守卫, 失败时保持 g_hChartBmp = NULL 走"无缓存"路径。
+    if (!hdcMem || !g_hChartBmp) {
+        if (g_hChartBmp) { DeleteObject(g_hChartBmp); g_hChartBmp = NULL; }
+        if (hdcMem) DeleteDC(hdcMem);
+        ReleaseDC(hwnd, hdcWnd);
+        return;
+    }
 
     HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, g_hChartBmp);
     FillRect(hdcMem, &rc, (HBRUSH)(COLOR_WINDOW + 1));
@@ -1785,45 +1910,76 @@ void RebuildChartCache(HWND hwnd) {
     {
         Gdiplus::Graphics g(hdcMem);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        // 代理人池 ECDF: X 轴 180 (UP 大保底)
-        DrawECDF (g, Gdiplus::Rect(DPIScale(20),  DPIScale(320), DPIScale(600), DPIScale(250)),
-                  statsAgent.freq_all, statsAgent.freq_up,
-                  statsAgent.count_all, statsAgent.count_up,
-                  statsAgent.censored_pity_all, statsAgent.censored_pity_up,
-                  g_cdf_agent, 92, g_cdf_agent_up, 182,
-                  L"代理人池累积分布 (ECDF)",  // 代理人池累积分布 (ECDF)
-                  180);
-        // 代理人池 MRL
-        DrawMRL  (g, Gdiplus::Rect(DPIScale(640), DPIScale(320), DPIScale(600), DPIScale(250)),
-                  statsAgent.freq_all, statsAgent.freq_up,
-                  statsAgent.count_all, statsAgent.count_up,
-                  statsAgent.censored_pity_all, statsAgent.censored_pity_up,
-                  g_cdf_agent, 92, g_cdf_agent_up, 182,
-                  L"代理人池剩余抽数期望 (MRL)",  // 代理人池剩余抽数期望 (MRL)
-                  180,
-                  /*theory_all_cap=*/90, /*theory_up_cap=*/180);
-        // 音擎池 ECDF: X 轴 160 (UP 大保底)
-        DrawECDF (g, Gdiplus::Rect(DPIScale(20),  DPIScale(575), DPIScale(600), DPIScale(250)),
-                  statsWEngine.freq_all, statsWEngine.freq_up,
-                  statsWEngine.count_all, statsWEngine.count_up,
-                  statsWEngine.censored_pity_all, statsWEngine.censored_pity_up,
-                  g_cdf_wengine, 82, g_cdf_wengine_up, 162,
-                  L"音擎池累积分布 (ECDF)",  // 音擎池累积分布 (ECDF)
-                  160);
-        // 音擎池 MRL
-        DrawMRL  (g, Gdiplus::Rect(DPIScale(640), DPIScale(575), DPIScale(600), DPIScale(250)),
-                  statsWEngine.freq_all, statsWEngine.freq_up,
-                  statsWEngine.count_all, statsWEngine.count_up,
-                  statsWEngine.censored_pity_all, statsWEngine.censored_pity_up,
-                  g_cdf_wengine, 82, g_cdf_wengine_up, 162,
-                  L"音擎池剩余抽数期望 (MRL)",  // 音擎池剩余抽数期望 (MRL)
-                  160,
-                  /*theory_all_cap=*/80, /*theory_up_cap=*/160);
+
+        // 布局 (与 WM_CREATE 中的控件 Y 坐标保持同步):
+        //   header inputs   :  15 -  100  (提示行 + 2 行配置)
+        //   output text     : 105 -  350  (h=245, 三段池块)
+        //   agent    row    : 360 -  610  (h=250)  独家频段
+        //   wengine  row    : 615 -  865  (h=250)  音擎频段
+        //   standard row    : 870 - 1120  (h=250)  常驻频段
+        //
+        // 三行均"图左 ECDF / 图右 MRL", 总宽 1240 (20 + 600 + 20 + 600 = 1240).
+        // 修改这里的 Y 时, WinMain 中窗口高度 1140 与 WM_CREATE 中 hOutEdit 的尺寸
+        // 也要同步, 三处必须一致, 否则要么 widget 溢出窗口要么底部出现空白带。
+
+        // ===== 独家频段 (代理人 UP 池) =====
+        // ECDF X 轴覆盖 UP 大保底间隔上限 180; 综合理论上限 90 (硬保底)
+        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(360), DPIScale(600), DPIScale(250)),
+                   statsAgent.freq_all, statsAgent.freq_up,
+                   statsAgent.count_all, statsAgent.count_up,
+                   statsAgent.censored_pity_all, statsAgent.censored_pity_up,
+                   g_cdf_agent, g_cdf_agent_up,
+                   L"独家频段 (代理人 UP) 累积分布 (ECDF)", 180,
+                   /*ecdf_up_step_size=*/1);
+        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(360), DPIScale(600), DPIScale(250)),
+                   statsAgent.freq_all, statsAgent.freq_up,
+                   statsAgent.count_all, statsAgent.count_up,
+                   statsAgent.censored_pity_all, statsAgent.censored_pity_up,
+                   g_cdf_agent, g_cdf_agent_up,
+                   L"独家频段 (代理人 UP) 剩余抽数期望 (MRL)", 180,
+                   /*theory_all_cap=*/90, /*theory_up_cap=*/180);
+
+        // ===== 音擎频段 (武器 UP 池) =====
+        // ECDF X 轴覆盖 UP 大保底间隔上限 160; 综合理论上限 80 (硬保底)
+        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(615), DPIScale(600), DPIScale(250)),
+                   statsWEngine.freq_all, statsWEngine.freq_up,
+                   statsWEngine.count_all, statsWEngine.count_up,
+                   statsWEngine.censored_pity_all, statsWEngine.censored_pity_up,
+                   g_cdf_wengine, g_cdf_wengine_up,
+                   L"音擎频段 (武器 UP) 累积分布 (ECDF)", 160,
+                   /*ecdf_up_step_size=*/1);
+        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(615), DPIScale(600), DPIScale(250)),
+                   statsWEngine.freq_all, statsWEngine.freq_up,
+                   statsWEngine.count_all, statsWEngine.count_up,
+                   statsWEngine.censored_pity_all, statsWEngine.censored_pity_up,
+                   g_cdf_wengine, g_cdf_wengine_up,
+                   L"音擎频段 (武器 UP) 剩余抽数期望 (MRL)", 160,
+                   /*theory_all_cap=*/80, /*theory_up_cap=*/160);
+
+        // ===== 常驻频段 (热门卡司) =====
+        // 无 UP 概念: theory_cdf_up 传【空 span】(std::span<const double>{}) →
+        // 红色 UP 系列 (理论虚线/经验阶梯/KS 标记/censored 标注) 全部自然消失;
+        // show_up=false 仅隐藏 UP 图例文字。综合复用 g_cdf_agent (同分布)。
+        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(870), DPIScale(600), DPIScale(250)),
+                   statsStandard.freq_all, statsStandard.freq_up,
+                   statsStandard.count_all, statsStandard.count_up,
+                   statsStandard.censored_pity_all, statsStandard.censored_pity_up,
+                   g_cdf_agent, std::span<const double>{},
+                   L"常驻频段 (热门卡司) 累积分布 (ECDF)", 90,
+                   /*ecdf_up_step_size=*/1, /*show_up=*/false);
+        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(870), DPIScale(600), DPIScale(250)),
+                   statsStandard.freq_all, statsStandard.freq_up,
+                   statsStandard.count_all, statsStandard.count_up,
+                   statsStandard.censored_pity_all, statsStandard.censored_pity_up,
+                   g_cdf_agent, std::span<const double>{},
+                   L"常驻频段 (热门卡司) 剩余抽数期望 (MRL)", 90,
+                   /*theory_all_cap=*/90, /*theory_up_cap=*/0, /*show_up=*/false);
     }
     SelectObject(hdcMem, hOld);
     DeleteDC(hdcMem);
     ReleaseDC(hwnd, hdcWnd);
 }
+
 static HFONT hFont = NULL;
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1833,44 +1989,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         hFont = CreateFontW(-DPIScale(13), 0, 0, 0, FW_NORMAL, 0, 0, 0,
                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
-
-        // 提示行
         HWND hL1 = CreateWindowW(L"STATIC",
-            L"请确认上方常驻 S 级名单（开服至今较少变动）；不在常驻名单内的 S 级即视为当期 UP；拖入 uigf_zzz.json 开始分析。",
+            L"UP 判定为二元化:S 级不在常驻名单即视为当期 UP(独家/音擎频段只会出\x201C当期 UP + 常驻 S\x201D两种 S 级),无需配置当期 UP。",
             WS_CHILD | WS_VISIBLE,
-            DPIScale(20), DPIScale(15), DPIScale(1200), DPIScale(20), hwnd, NULL, NULL, NULL);
-
-        // 第 1 行: 常驻 S 级代理人
-        HWND hL_AgentStd = CreateWindowW(L"STATIC",
-            L"常驻 S 级代理人:",
+            DPIScale(20), DPIScale(15), DPIScale(1100), DPIScale(20), hwnd, NULL, NULL, NULL);
+        HWND hL_Agent = CreateWindowW(L"STATIC", L"常驻S级代理人:",
             WS_CHILD | WS_VISIBLE,
-            DPIScale(20), DPIScale(45), DPIScale(125), DPIScale(20), hwnd, NULL, NULL, NULL);
+            DPIScale(20), DPIScale(45), DPIScale(110), DPIScale(20), hwnd, NULL, NULL, NULL);
         hAgentEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
             L"猫又,「11号」,珂蕾妲,莱卡恩,格莉丝,丽娜",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            DPIScale(150), DPIScale(40), DPIScale(1090), DPIScale(26), hwnd, NULL, NULL, NULL);
-
-        // 第 2 行: 常驻 S 级音擎
-        HWND hL_WepStd = CreateWindowW(L"STATIC",
-            L"常驻 S 级音擎:",
+            DPIScale(135), DPIScale(40), DPIScale(1105), DPIScale(26), hwnd, NULL, NULL, NULL);
+        HWND hL_WEngine = CreateWindowW(L"STATIC", L"常驻S级音擎:",
             WS_CHILD | WS_VISIBLE,
-            DPIScale(20), DPIScale(75), DPIScale(125), DPIScale(20), hwnd, NULL, NULL, NULL);
+            DPIScale(20), DPIScale(75), DPIScale(110), DPIScale(20), hwnd, NULL, NULL, NULL);
         hWEngineEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
             L"钢铁肉垫,硫磺石,燃狱齿轮,拘缚者,嵌合编译器,啜泣摇篮",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            DPIScale(150), DPIScale(70), DPIScale(1090), DPIScale(26), hwnd, NULL, NULL, NULL);
+            DPIScale(135), DPIScale(70), DPIScale(1105), DPIScale(26), hwnd, NULL, NULL, NULL);
 
-        // 输出区
         hOutEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
             L"等待拖入文件...",
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
-            DPIScale(20), DPIScale(105), DPIScale(1220), DPIScale(205), hwnd, NULL, NULL, NULL);
+            DPIScale(20), DPIScale(105), DPIScale(1220), DPIScale(245), hwnd, NULL, NULL, NULL);
 
-        DWORD tabStops[] = {50};
+        DWORD tabStops[] = {50};        DWORD tabStops[] = {50};
         SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
         SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 
-        for (HWND h : {hL1, hL_AgentStd, hAgentEdit, hL_WepStd, hWEngineEdit, hOutEdit})
+        for (HWND h : {hL1, hL_Agent, hAgentEdit, hL_WEngine, hWEngineEdit, hOutEdit})
             SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
         RebuildChartCache(hwnd);
         break;
@@ -1880,13 +2027,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t filePath[MAX_PATH];
         DragQueryFileW(hDrop, 0, filePath, MAX_PATH);
         DragFinish(hDrop);
-        // 异步提交; Submit 内部做双开保护 (g_processing CAS 锁)
-        // 失败 (已有 worker 在跑或 I/O 失败) 时静默忽略, UI 上保留之前的状态
+        // 异步提交;Submit 内部做双开保护(g_processing CAS 锁)
+        // 失败(已有 worker 在跑或 I/O 失败)时静默忽略,UI 上保留之前的状态
         ProcessFile_Submit(hwnd, filePath);
         break;
     }
     case WM_APP_PROCESS_DONE: {
-        // worker 完成, 主线程消费结果 (更新全局 stats、刷新 UI)
+        // worker 完成,主线程消费结果(更新全局 stats、刷新 UI)
         auto* out = (ProcessOutput*)lParam;
         ProcessFile_Consume(hwnd, out);
         break;
@@ -1909,6 +2056,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_ERASEBKGND: return 1;
     case WM_DESTROY: {
+        // v0.1.3.3: 退出前先 join worker。此刻 hwnd 仍有效, worker 的 PostMessageW 仍能
+        // 成功入队; worker 从不 SendMessage 回主线程 (只用非阻塞 PostMessage), 故这里等待
+        // 不会死锁。等待时长 = 剩余分析时间 (本工具数据量下为毫秒级)。
+        // 不等待的后果: WinMain 返回 → ExitProcess 直接终止 worker, 其若恰好持有 CRT 堆锁,
+        // 退出流程可能挂死 —— 这才是真实风险 (旧注释"OS 统一回收、无实际危害"不成立)。
+        if (g_hWorker) {
+            WaitForSingleObject(g_hWorker, INFINITE);
+            CloseHandle(g_hWorker);
+            g_hWorker = NULL;
+        }
+        // join 之后, 若 worker 投递过结果, 该消息还躺在线程队列里且永远不会被派发
+        // (窗口即将销毁) —— 在此 reap 并释放载荷, 否则 ProcessOutput + mmap 句柄泄漏到
+        // 进程退出。与 Consume 不会双重 delete: 消息要么已派发 (队列里没有), 要么在队列
+        // 里 (未派发), 二者互斥; reap 只删队列里取出的那份。
+        MSG pending;
+        while (PeekMessageW(&pending, hwnd, WM_APP_PROCESS_DONE, WM_APP_PROCESS_DONE, PM_REMOVE)) {
+            delete reinterpret_cast<ProcessOutput*>(pending.lParam);
+        }
+        InterlockedExchange(&g_processing, 0);
         if (g_hChartBmp) { DeleteObject(g_hChartBmp); g_hChartBmp = NULL; }
         if (hFont) DeleteObject(hFont);
         PostQuitMessage(0);
@@ -1919,7 +2085,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
-    LoadLibrary(L"Msftedit.dll");
+    // v0.1.3.3: RichEdit50W 依赖 Msftedit.dll。消费级 Windows (含 N 版) 均随系统分发,
+    // 仅 WinPE / 深度精简系统可能缺失 —— 旧版忽略返回值, 缺失时四个 RichEdit 创建为 NULL,
+    // 后续 SendMessage / SetWindowText 全部静默落空, 界面空白且无任何提示。现显式报错退出。
+    if (!LoadLibraryW(L"Msftedit.dll")) {
+        MessageBoxW(NULL,
+                    L"无法加载 Msftedit.dll (RichEdit 控件库)。\n"
+                    L"本程序的文本界面依赖该系统组件, 请在完整版 Windows 上运行。",
+                    L"组件缺失", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     SetProcessDPIAware();
     HDC hdcScreen = GetDC(NULL);
     g_dpi = GetDeviceCaps(hdcScreen, LOGPIXELSX);
@@ -1939,21 +2114,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     RegisterClassW(&wc);
 
     DWORD dwStyle = (WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
-    // 窗口高度 860: 提示行(15) + 2 个输入框(30*2=60) + 输出区(205) + 图表区(2*250=500) + 间距/边距 ≈ 860
-    RECT rect = {0, 0, DPIScale(1280), DPIScale(860)};
+    // 窗口尺寸:
+    //   高度: 1140 = 顶部配置区 350 (提示行 + 2 行配置 + 输出文本) + 3 图表行 ×250 + 边距吸收。
+    //         比终末地 (1170, 4 行配置 + 4 图表行) 矮 30: ZZZ 配置只 2 行, 输出区底端
+    //         上移到 350 (终末地 380)。三处必须同步: 此高度 / RebuildChartCache 的 Y 坐标 /
+    //         WM_CREATE 的 hOutEdit 尺寸。
+    //   宽度: 1260, 左右留白对称 (内容右边界 x=1240, 左留白 20 → 右留白也 20)。
+    RECT rect = {0, 0, DPIScale(1260), DPIScale(1140)};
     AdjustWindowRectEx(&rect, dwStyle, FALSE, 0);
 
-    HWND hwnd = CreateWindowW(wc.lpszClassName,
-        L"绝区零抽卡记录分析与可视化",  // 绝区零抽卡记录分析与可视化
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"绝区零抽卡记录分析与可视化",
         dwStyle, CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
         NULL, NULL, hInstance, NULL);
     ShowWindow(hwnd, nCmdShow);
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    // v0.1.3.3: GetMessage 的返回值是三态 (>0 取到消息 / 0 收到 WM_QUIT / -1 出错),
+    // 旧写法 while (GetMessage(...)) 把 -1 当真值 —— 出错时 msg 内容未定义, 循环会带着
+    // 无效消息空转。当前参数 (hwnd=NULL 过滤 + 有效指针) 下 -1 实际不可达, 属防御性修正;
+    // 顺带显式用 W 版 (GetMessageW / DispatchMessageW), 与本文件全 W 系窗口代码一致,
+    // 不再依赖 UNICODE 宏决定 A/W。
+    for (;;) {
+        BOOL ret = GetMessageW(&msg, NULL, 0, 0);
+        if (ret == 0)  break;   // WM_QUIT: 正常退出
+        if (ret == -1) break;   // 错误: msg 未定义, 不可 Dispatch, 直接进入清理
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
     }
     Gdiplus::GdiplusShutdown(gdiplusToken);
     return 0;

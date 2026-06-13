@@ -1,26 +1,36 @@
 // ============================================================
-// ZZZ Gacha Exporter - UIGF v4.2 / 面向数据 / PMR 栈分配
-// ============================================================
-// 绝区零 (Zenless Zone Zero) 抽卡记录导出工具
+// ZZZ Gacha Exporter - UIGF v4.2 (nap) / 面向数据 / PMR / AoS
+// ------------------------------------------------------------
+// 自 Endfield Gacha Exporter (v0.1.3.3 加固版) 迁移到绝区零。
 //
-// 与终末地版本的关键差异:
-//   1. API 来自米哈游 HoYoverse,不再是鹰角 Gryphline
-//      端点: /common/gacha_record/api/getGachaLog
-//      翻页: 用 end_id 游标 (不是 seq_id), size 上限 20
-//      鉴权: authkey URL-encoded 在原 URL 里, 整段透传, 不解析
-//   2. 卡池类型 (real_gacha_type/gacha_type):
-//        "1" = 常驻频段(热门卡司)
-//        "2" = 独家频段(代理人 UP)
-//        "3" = 音擎频段(武器 UP)
-//        "5" = 邦布频段
-//      UIGF v4.2 nap.gacha_type enum 与之一致
-//   3. 没有"30 抽赠送十连"机制, 不需要 is_free 字段
-//   4. 物品类型字段值: "代理人"/"音擎"/"邦布" (中文 lang) 或英文
-//   5. 输出键: 顶层 "nap" (UIGF v4.2 标准, 而非自定义 "endfield")
-//   6. UIGF v4.2 nap 必填字段: gacha_type / item_id / time / id
-//      还需 count (api 返回, 一般为 "1")
+// 绝区零数据契约 (米哈游 HoYoverse API):
+//   1. 端点: /common/gacha_record/api/getGachaLog
+//      翻页: end_id 游标 (上一页最后一条的 id; "0" 表示从最新开始), size 上限 20
+//      鉴权: authkey + authkey_ver + sign_type; authkey 是大段 percent-encoded 串
+//      (约 1~2KB), 整段透传, 不解析不重组 → 输入缓冲必须够大 (16KB)
+//   2. 卡池类型 (real_gacha_type / 同时也是 UIGF 的 gacha_type 值):
+//        "1" = 常驻频段(热门卡司)  "2" = 独家频段(代理人 UP)
+//        "3" = 音擎频段(武器 UP)   "5" = 邦布频段
+//   3. 物品类型字段值: "代理人"/"音擎"/"邦布" (zh-cn lang)
+//   4. 响应包装: {"retcode": 0, "message": "OK", "data": {...}}
+//      (与鹰角的 {"code": 0, "msg": ...} 字段名不同)
+//   5. ID 是 19 位全局递增整数; 去重直接用 id (全局唯一, 不需要武器取负 trick);
+//      排序按 id 升序即时间升序 (单关键字)
+//   6. time 字段是服务器时区 (UTC+8) 本地时间字符串, 直接原样写 UIGF,
+//      timezone=8 自洽; 未知区服 fallback 本机时区
+//   7. 终止条件: API 返回空 list = 该池翻完 (没有 hasMore 字段)
+//   8. uid: 每条记录都带, 取首个非空写入 nap[0].uid (UIGF v4.2 必填)
 //
-// 编译: cl /std:c++20 /EHsc /O2 main.cpp
+// 解析健壮性: 基底文件可能是含多游戏段的 UIGF v4.2 文件 (hk4e/hkrpg/nap 并存,
+// 每段内层都有 "list"), 先定位 "nap" 再找其内层 "list"; 找不到 "nap" 才回退
+// 全文件搜索 (兼容只含 ZZZ 数据的宽松第三方文件)。
+//
+// 继承自 Endfield v0.1.3.3 的全部加固语义:
+//   - FetchPath netOk 出参: 读流中途失败 ≠ 自然结束, 截断响应不再被当完整数据
+//   - fetchAborted: 翻页中途失败/重复 id (游标异常) → 整次中止不写盘, 防记录缺口
+//   - 基底验收 (A2): 文件存在但读不出 "list" 结构 → 中止, 防覆盖原历史
+//   - BufferedWriter ok 跟踪 + writeOk: 写失败删 tmp 不替换原文件
+//   - GetFileSizeEx (64 位) + SIZE_MAX 校验; 堆上 2MB PMR arena (不清零)
 // ============================================================
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +46,8 @@
 #include <charconv>
 #include <ranges>
 #include <memory_resource>
+#include <memory>           // std::make_unique_for_overwrite (C++20): 2MB PMR arena 在堆上不清零分配
+#include <cstdint>          // uint8_t / SIZE_MAX
 #include <array>
 #include <numeric>
 #include <unordered_set>
@@ -44,46 +56,24 @@
 #pragma comment(lib, "User32.lib")
 
 // ---------------------------------------------------------
-// [枚举 / 无堆分配的大小写不敏感包含比较]
+// [枚举]
 // ---------------------------------------------------------
-// 绝区零有三种物品类型: 代理人(角色) / 音擎(武器) / 邦布(宠物)
-// API 返回的 item_type 在 zh-cn 下就是中文名, 直接精确匹配
 enum class ItemType : uint8_t { Unknown = 0, Agent, WEngine, Bangboo };
 
-// 无堆分配的大小写不敏感 find —— 原版每次都 std::string 拷贝, 这是 hot-path bug
-inline bool ContainsCI(std::string_view haystack, std::string_view needle) {
-    if (needle.empty() || haystack.size() < needle.size()) return false;
-    const size_t H = haystack.size();
-    const size_t N = needle.size();
-    for (size_t i = 0; i + N <= H; ++i) {
-        bool ok = true;
-        for (size_t j = 0; j < N; ++j) {
-            char a = haystack[i + j];
-            char b = needle[j];
-            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
-            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
-            if (a != b) { ok = false; break; }
-        }
-        if (ok) return true;
-    }
-    return false;
-}
-
 inline ItemType ParseItemType(std::string_view sv) {
-    // zh-cn 下 API 返回中文 item_type 字段; 也兼容英文(en-us 等)
-    // 中文短串直接 byte 级精确比较, 不做 lower (中文无大小写概念)
+    // API zh-cn 直接返回中文短串, byte 级精确比较 (UTF-8 源文件)
     if (sv == "代理人") return ItemType::Agent;
     if (sv == "音擎")   return ItemType::WEngine;
     if (sv == "邦布")   return ItemType::Bangboo;
-    // 防御性英文兼容 (Agents / W-Engines / Bangboos)
-    if (ContainsCI(sv, "agent"))   return ItemType::Agent;
-    if (ContainsCI(sv, "engine"))  return ItemType::WEngine;
-    if (ContainsCI(sv, "bangboo")) return ItemType::Bangboo;
+    // 防御性英文兼容 (en 语言导出的第三方基底文件)
+    if (sv == "Agents"    || sv == "Agent")    return ItemType::Agent;
+    if (sv == "W-Engines" || sv == "W-Engine") return ItemType::WEngine;
+    if (sv == "Bangboos"  || sv == "Bangboo")  return ItemType::Bangboo;
     return ItemType::Unknown;
 }
 
 inline std::string_view ItemTypeToStr(ItemType type) {
-    // 输出 UIGF 文件时统一用中文, 与游戏内 / API 一致, 也与 zh-cn lang 自洽
+    // 输出 UIGF 时统一用中文, 与 API zh-cn 返回值一致
     if (type == ItemType::Agent)   return "代理人";
     if (type == ItemType::WEngine) return "音擎";
     if (type == ItemType::Bangboo) return "邦布";
@@ -119,7 +109,7 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
         ++pos;
         size_t endPos = pos;
         while (endPos < source.length() && source[endPos] != '"') {
-            // 修复: \\ 处理必须是"跳 2 字节", 原版 source[endPos]='\\' 后只 endPos++ 一次, 边界上会越界
+            // \\ 处理必须是"跳 2 字节", 边界上不会越界
             if (source[endPos] == '\\' && endPos + 1 < source.length()) endPos += 2;
             else ++endPos;
         }
@@ -134,15 +124,18 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
     }
 }
 
-// O(N) 逐字符扫描
+// O(N) 逐字符扫描。
+// 返回值 bool —— 是否定位到了 "arrayKey": [ ... ] 数组结构 (数组为空也算定位成功)。
+// 基底加载用它区分"结构正确的空数据"(正常, 0 条) 与"无结构的损坏/异类文件"
+// (中止, 防止覆盖原历史)。
 template<typename Callback>
-void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
+bool ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
     size_t pos = FindJsonKey(source, arrayKey);
-    if (pos == std::string_view::npos) return;
+    if (pos == std::string_view::npos) return false;
     pos = source.find(':', pos + arrayKey.length() + 2);
-    if (pos == std::string_view::npos) return;
+    if (pos == std::string_view::npos) return false;
     pos = source.find('[', pos);
-    if (pos == std::string_view::npos) return;
+    if (pos == std::string_view::npos) return false;
 
     int depth = 0;
     size_t objStart = 0;
@@ -166,6 +159,14 @@ void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callb
             break;
         }
     }
+    return true;   // 已定位数组 (即便其中 0 个对象)
+}
+
+// nap 段定位: 找到 "nap" key 则从那里起取子串 (在其内找到的第一个 "list" 即
+// nap[0].list; info 块没有 list, 账号对象的 uid 也在 list 之前), 否则原样返回。
+inline std::string_view ScopeToNap(std::string_view source) {
+    size_t pos = FindJsonKey(source, "nap");
+    return pos == std::string_view::npos ? source : source.substr(pos);
 }
 
 inline std::wstring Utf8ToWstring(std::string_view str) {
@@ -176,8 +177,6 @@ inline std::wstring Utf8ToWstring(std::string_view str) {
     return result;
 }
 
-// 从原始 URL 里抠出某个 query 参数的 raw value (含 URL 编码部分)
-// 与终末地版本完全一致, 米哈游 authkey 是大段 percent-encoded 串, 必须原样透传
 inline std::string_view ExtractUrlParam(std::string_view url, std::string_view key) {
     size_t pos = url.find(key);
     if (pos == std::string_view::npos) return {};
@@ -187,21 +186,21 @@ inline std::string_view ExtractUrlParam(std::string_view url, std::string_view k
 }
 
 // ---------------------------------------------------------
-// [AoS 记录]
-// 绝区零 id 字段是 19 位数字字符串, 全局递增, 没有"角色/武器交叉" id 冲突,
-// 所以不需要终末地版本里"武器取负"的 trick. 直接用 long long 唯一去重即可.
+// [AoS 记录 - 导出场景多字段一起访问, AoS 空间局部性更好]
+// 全部 string_view 指向 networkPayloads (deque<string>) 内字节;
+// deque emplace_back 不失效已有指针。
 // ---------------------------------------------------------
 struct ExportRecord {
-    long long id;             // 19 位数字 ID, long long 完全装得下 (max ~9.2e18)
-    long long timestamp;      // gacha_ts: 抽卡时间秒级时间戳 (fallback)
-    std::string_view gachaType;  // "1"/"2"/"3"/"5"
-    std::string_view itemId;
+    long long safe_id;           // 19 位全局递增 ID (全局唯一, 去重键 + 排序键)
+    long long timestamp;         // 秒级时间戳 fallback (主路径用 timeStr)
+    std::string_view poolId;     // UIGF gacha_type: "1"/"2"/"3"/"5"
+    std::string_view item_id;
     std::string_view name;
-    ItemType itemType;
-    std::string_view rankType;   // "2"/"3"/"4" (B/A/S)
+    ItemType item_type;
+    std::string_view rank_type;  // "2"/"3"/"4" (B/A/S)
     std::string_view count;      // 一般 "1"
-    std::string_view gachaId;    // API 返回的 gacha_id, 池子的具体期次 ID
-    std::string_view timeStr;    // API 返回的 time 字符串 "YYYY-MM-DD HH:MM:SS" (服务器时区, 优先用这个)
+    std::string_view gachaId;    // API gacha_id, 池子期次 ID
+    std::string_view timeStr;    // API time 字符串 "YYYY-MM-DD HH:MM:SS" (服务器时区)
 };
 
 // ---------------------------------------------------------
@@ -228,9 +227,13 @@ struct WinHttpHandle {
 };
 
 // ---------------------------------------------------------
-// [FetchPath - 修复 WinHttpQueryDataAvailable 失败死循环]
+// [FetchPath - netOk 出参: 读流中途失败 ≠ 自然结束]
 // ---------------------------------------------------------
-std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
+// 仅 HTTP 200 且响应体完整读毕才置 netOk=true; 任一环节 (打开/发送/接收/状态码/
+// 可用量查询/读取) 失败都置 false, 由调用方按失败处理。否则截断恰好落在 list 中段
+// 时, 解析端能读出 retcode:0 与若干完整记录, 部分数据会被当完整数据提交。
+std::string FetchPath(HINTERNET hConnect, const std::wstring& path, bool& netOk) {
+    netOk = false;
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL,
                                             WINHTTP_NO_REFERER,
                                             WINHTTP_DEFAULT_ACCEPT_TYPES,
@@ -243,41 +246,59 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
               WinHttpReceiveResponse(hRequest, NULL);
 
     if (ok) {
-        char stackBuf[8192];
-        DWORD dwSize = 0, dwDownloaded = 0;
-        while (true) {
-            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
-            if (dwSize == 0) break;
-            if (dwSize <= sizeof(stackBuf)) {
-                if (!WinHttpReadData(hRequest, stackBuf, dwSize, &dwDownloaded)) break;
-                if (dwDownloaded == 0) break;
-                response.append(stackBuf, dwDownloaded);
-            } else {
-                std::vector<char> heapBuf(dwSize);
-                if (!WinHttpReadData(hRequest, heapBuf.data(), dwSize, &dwDownloaded)) break;
-                if (dwDownloaded == 0) break;
-                response.append(heapBuf.data(), dwDownloaded);
+        DWORD status = 0, statusSize = sizeof(status);
+        ok = WinHttpQueryHeaders(hRequest,
+                                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+                                 WINHTTP_NO_HEADER_INDEX) &&
+             status == 200;
+    }
+
+    if (ok) {
+        // 固定 16KB 复用缓冲分块读完
+        std::array<char, 16384> readBuf;
+        bool readFailed = false;
+        bool reading = true;
+        while (reading) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &available)) { readFailed = true; break; }
+            if (available == 0) break;   // 自然结束 (与查询失败区分开)
+            while (available > 0) {
+                DWORD bufSz = (DWORD)readBuf.size();
+                DWORD chunk  = (available < bufSz) ? available : bufSz;
+                DWORD downloaded = 0;
+                if (!WinHttpReadData(hRequest, readBuf.data(), chunk, &downloaded) ||
+                    downloaded == 0) {
+                    readFailed = true;   // 读失败 / 流提前终止: 不可当自然结束
+                    reading = false;
+                    break;
+                }
+                response.append(readBuf.data(), downloaded);
+                available -= downloaded;
             }
         }
+        netOk = !readFailed;
     }
     WinHttpCloseHandle(hRequest);
     return response;
 }
 
+// 4 个频段配置 (real_gacha_type 同时也是 UIGF gacha_type)
 struct PoolConfig {
-    std::string realGachaType;     // API 参数 real_gacha_type
-    std::string initLogBaseType;   // API 参数 init_log_gacha_base_type (一般等于 real_gacha_type)
-    std::string uigfGachaType;     // 写到 UIGF 文件里的 gacha_type ("1"/"2"/"3"/"5")
-    std::string displayName;       // 控制台展示用
+    std::string realGachaType;    // API 参数 real_gacha_type
+    std::string initLogBaseType;  // API 参数 init_log_gacha_base_type (一般同上)
+    std::string uigfGachaType;    // 写入 UIGF 的 gacha_type
+    std::string displayName;
 };
 
 // ---------------------------------------------------------
-// [BufferedWriter - 析构 RAII Flush]
+// [BufferedWriter - 析构 RAII Flush + 短写/失败检查]
 // ---------------------------------------------------------
 struct BufferedWriter {
     HANDLE hFile;
     char buf[65536];
     DWORD pos = 0;
+    bool ok = true;   // 一旦写失败置 false: 后续 Flush/Write 短路, 调用方据此决定是否提交结果
 
     explicit BufferedWriter(HANDLE h) : hFile(h) {}
     ~BufferedWriter() { Flush(); }
@@ -285,60 +306,56 @@ struct BufferedWriter {
     BufferedWriter(const BufferedWriter&) = delete;
     BufferedWriter& operator=(const BufferedWriter&) = delete;
 
-    void Flush() {
-        if (pos > 0 && hFile != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hFile, buf, pos, &written, NULL);
-            pos = 0;
+    bool Flush() {
+        if (!ok) return false;
+        if (hFile == INVALID_HANDLE_VALUE) { ok = false; return false; }
+        DWORD offset = 0;
+        while (offset < pos) {
+            DWORD written = 0;
+            if (!WriteFile(hFile, buf + offset, pos - offset, &written, nullptr) ||
+                written == 0) {
+                ok = false;
+                return false;
+            }
+            offset += written;
         }
+        pos = 0;
+        return true;
     }
     void Write(const char* data, DWORD len) {
+        if (!ok) return;
         while (len > 0) {
             DWORD space = sizeof(buf) - pos;
             DWORD chunk = (len < space) ? len : space;
             std::memcpy(buf + pos, data, chunk);
             pos += chunk; data += chunk; len -= chunk;
-            if (pos == sizeof(buf)) Flush();
+            if (pos == sizeof(buf) && !Flush()) return;
         }
     }
     void Write(std::string_view sv) { Write(sv.data(), (DWORD)sv.size()); }
 
     template<size_t N>
     void WriteLit(const char (&s)[N]) {
+        if (!ok) return;
         constexpr DWORD len = N - 1;
-        if (pos + len > sizeof(buf)) Flush();
+        if (pos + len > sizeof(buf) && !Flush()) return;
         std::memcpy(buf + pos, s, len);
         pos += len;
     }
 
-    void WriteEscaped(std::string_view s) {
-        const char* p = s.data();
-        const char* end = p + s.size();
-        while (p < end) {
-            const char* clean = p;
-            while (p < end && *p != '"' && *p != '\\') ++p;
-            if (p > clean) Write(clean, (DWORD)(p - clean));
-            if (p < end) {
-                if (*p == '"') WriteLit("\\\"");
-                else           WriteLit("\\\\");
-                ++p;
-            }
-        }
-    }
-
+    // WriteKV 的 val 全部来自 ExtractJsonValue 的【原始转义形态】视图 (扫描器不解码
+    // 转义, 返回引号之间的原文), 本就是合法的 JSON 字符串内容, 必须【原样写出】。
+    // 再转义一遍会把 `\` 翻倍, 破坏往返幂等。
     void WriteKV(std::string_view key, std::string_view val) {
         WriteLit("            \"");
         Write(key);
         WriteLit("\": \"");
-        WriteEscaped(val);
+        Write(val);          // 原始转义形态, 原样写出
         WriteLit("\"");
     }
 
-    // UIGF v4.2 要求 time 字段是 "YYYY-MM-DD HH:MM:SS" 格式的本地时间.
-    // 米哈游 API 返回的 time 字段本身就是这种字符串(已经是服务器时区下的本地时间),
-    // 所以这里其实只在我们 fallback 用 gacha_ts 时才用; 主路径直接写 API 原 time.
-    void WriteTimeKV(std::string_view key, long long sec_ts) {
-        time_t t = sec_ts;
+    void WriteTimeKV(std::string_view key, long long ms_ts) {
+        time_t t = ms_ts / 1000;
         struct tm tm_info;
         localtime_s(&tm_info, &t);
         char tbuf[64];
@@ -367,16 +384,17 @@ struct BufferedWriter {
 int main() {
     SetConsoleOutputCP(CP_UTF8);
 
-    // URL 缓冲区: 米哈游 authkey 是大段 percent-encoded 串, 单 authkey 就 ~1.5KB,
-    // 完整 URL 加其它参数约 1.7KB. 给 16KB 留足富余 (栈数组, 不会爆栈).
+    // 16KB 输入缓冲: authkey 是约 1~2KB 的 percent-encoded 串, 加上完整 URL 其余
+    // 参数, 1KB 缓冲必然截断 → 鉴权必败。16KB 留足余量, 并显式检测截断。
     static char urlBuffer[16384];
-    printf("请输入您的绝区零抽卡记录完整链接 (含 authkey 的 URL):\n> ");
+    printf("请输入您的绝区零抽卡记录完整链接 (含 authkey 参数, 来自游戏内抽卡记录页面):\n> ");
     if (!fgets(urlBuffer, sizeof(urlBuffer), stdin)) return 1;
-
-    // 截断检测: 如果读了 sizeof-1 字节但末尾不是 '\n', 说明 URL 比缓冲区还长
-    size_t urlLen = strlen(urlBuffer);
-    if (urlLen == sizeof(urlBuffer) - 1 && urlBuffer[urlLen - 1] != '\n') {
-        printf("警告: 输入的 URL 超过 16KB，可能被截断。\n");
+    if (!strchr(urlBuffer, '\n') && strlen(urlBuffer) == sizeof(urlBuffer) - 1) {
+        // 缓冲读满且没有换行 = 输入被截断, authkey 不完整, 继续必然鉴权失败
+        printf("错误: 链接过长被截断 (超过 %zu 字节)。请确认复制的是单条 getGachaLog 链接。\n",
+               sizeof(urlBuffer) - 1);
+        system("pause");
+        return 1;
     }
 
     std::string_view inputUrl(urlBuffer);
@@ -386,37 +404,38 @@ int main() {
         inputUrl.remove_suffix(1);
     }
 
-    // 必须的鉴权三件套: authkey + authkey_ver + sign_type
-    auto authkey     = ExtractUrlParam(inputUrl, "authkey=");
-    auto authkeyVer  = ExtractUrlParam(inputUrl, "authkey_ver=");
-    auto signType    = ExtractUrlParam(inputUrl, "sign_type=");
+    // ZZZ 鉴权三件套: authkey + authkey_ver + sign_type, 整段透传
+    auto authkey = ExtractUrlParam(inputUrl, "authkey=");
     if (authkey.empty()) {
-        printf("错误: 无法提取 authkey。\n");
-        system("pause"); return 1;
+        printf("错误: 无法提取 authkey。请确认链接含 authkey= 参数。\n");
+        system("pause");
+        return 1;
     }
-    if (authkeyVer.empty()) authkeyVer = "1";
-    if (signType.empty())   signType   = "2";
+    auto authkeyVer = ExtractUrlParam(inputUrl, "authkey_ver=");
+    auto signType   = ExtractUrlParam(inputUrl, "sign_type=");
+    std::string authkeyVerStr = authkeyVer.empty() ? std::string("1") : std::string(authkeyVer);
+    std::string signTypeStr   = signType.empty()   ? std::string("2") : std::string(signType);
 
-    // game_biz / region 标识区服, 也需要透传; 不同区服走不同 host
+    // game_biz / region 标识区服, 透传; 不同区服走不同 host
     auto gameBiz = ExtractUrlParam(inputUrl, "game_biz=");
     auto region  = ExtractUrlParam(inputUrl, "region=");
-    if (gameBiz.empty()) gameBiz = "nap_global";
+    std::string gameBizStr = gameBiz.empty() ? std::string("nap_global") : std::string(gameBiz);
+    std::string regionStr(region);
 
     // 选择 host:
-    //   nap_cn         -> public-operation-nap.mihoyo.com (国服, 米游社)
-    //   nap_global     -> public-operation-nap-sg.hoyoverse.com (国际服)
-    //   其它(测试服等) -> 默认走国际服 host, 通常也能解析
+    //   nap_cn -> public-operation-nap.mihoyo.com (国服)
+    //   其它   -> public-operation-nap-sg.hoyoverse.com (国际服)
     std::wstring hostName;
-    if (gameBiz == "nap_cn") {
+    if (gameBizStr == "nap_cn") {
         hostName = L"public-operation-nap.mihoyo.com";
-        printf("已识别区服: 国服 (mihoyo)\n");
+        printf("\n已自动识别区服: 国服 (mihoyo)\n");
     } else {
         hostName = L"public-operation-nap-sg.hoyoverse.com";
-        printf("已识别区服: 国际服 (hoyoverse)\n");
+        printf("\n已自动识别区服: 国际服 (hoyoverse)\n");
     }
 
-    // 4 个池子. 顺序: 限定代理人池 / 限定音擎池 / 邦布池 / 常驻池
-    // 这个顺序是为了让"用户最关心的池子先抓"; 实际去重靠 id, 顺序不影响正确性.
+    // 4 个频段. 顺序: 独家 / 音擎 / 邦布 / 常驻 (用户最关心的先抓;
+    // 去重靠全局唯一 id, 顺序不影响正确性)
     std::vector<PoolConfig> pools = {
         {"2", "2", "2", "独家频段 - 代理人 UP"},
         {"3", "3", "3", "音擎频段 - 武器 UP"},
@@ -424,47 +443,59 @@ int main() {
         {"1", "1", "1", "常驻频段"},
     };
 
-    // PMR: 栈上 2MB 池 (与终末地 main.cpp 同款).
-    // 注意: MSVC main 线程默认栈只 1MB, 直接放 2MB 会爆栈崩溃。
-    // 必须在链接器加 /STACK:4194304 (4MB) 才能用栈池。
-    // 栈池 vs 堆池的性能差异:
-    //   - 分配/释放开销 0 (栈指针偏移 vs malloc 一次 2MB + free)
-    //   - 与栈上的局部变量物理相邻, L1/L2 命中, TLB 不会 miss
-    //   - monotonic_buffer 整个工作集都从此池分配, 锁在热区
-    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
-    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
+    // PMR: 2MB 单调缓冲池在【堆】上 (make_unique_for_overwrite 不清零)。
+    //   - 没显式指定 upstream → 默认 get_default_resource(): 记录数远超
+    //     reserve(10000) 把 2MB 用尽时 fallback 到堆而非崩溃 (有意为之)。
+    //   - 生命周期: arena → pool → alloc 顺序声明, 析构逆序, pool 引用的
+    //     arena 内存在 pool 存活期间始终有效。
+    constexpr size_t kArenaSize = 2 * 1024 * 1024;
+    auto arena = std::make_unique_for_overwrite<std::byte[]>(kArenaSize);
+    std::pmr::monotonic_buffer_resource pool(arena.get(), kArenaSize);
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
+    // AoS 记录
     std::pmr::vector<ExportRecord> records(alloc);
-    records.reserve(20000);
+    records.reserve(10000);
 
     std::deque<std::string> networkPayloads;
 
-    // 去重: unordered_set O(1) 查询, 比 vector linear scan O(n) 快得多
-    std::pmr::unordered_set<long long> local_ids(alloc);
-    local_ids.reserve(20000);
+    // 去重: unordered_set O(1)
+    std::pmr::unordered_set<long long> local_safe_ids(alloc);
+    local_safe_ids.reserve(10000);
 
     std::string uigfFilename = "uigf_zzz.json";
+    std::string uid;   // 真实 uid: 基底文件 nap[0].uid 或 API 记录里的 uid, 先到先得
 
     // ---- 读取本地老记录 (读完立即释放句柄, 避免锁住目标文件) ----
+    // 基底验收口径 (A2): 文件【不存在】= 全新拉取 (正常); 文件存在但打不开 /
+    // 0 字节 / 映射失败 / 找不到 "list" 数组结构 = 按损坏处理, 中止且不写盘,
+    // 防止运行结束时 MoveFileEx 覆盖原历史; "list" 数组存在但为空 = 结构正确的
+    // 空数据, 0 条正常继续。
+    bool baseFileExists = false;   // 文件存在 (无论能否读)
+    bool baseLoadOk     = false;   // 打开 + 映射 + 结构 ("list" 数组) 三关全过
     {
         FileHandle hFile;
         hFile.h = CreateFileA(uigfFilename.c_str(), GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile.h != INVALID_HANDLE_VALUE) {
-            DWORD fileSize = GetFileSize(hFile, NULL);
-            if (fileSize != INVALID_FILE_SIZE && fileSize > 0) {
+            baseFileExists = true;
+            // GetFileSizeEx (64 位) + size_t 上界校验
+            LARGE_INTEGER fileSize64{};
+            if (GetFileSizeEx(hFile, &fileSize64) &&
+                fileSize64.QuadPart > 0 &&
+                static_cast<unsigned long long>(fileSize64.QuadPart) <=
+                    static_cast<unsigned long long>(SIZE_MAX)) {
+                size_t fileSize = static_cast<size_t>(fileSize64.QuadPart);
                 MappingHandle hMap;
                 hMap.h = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
                 if (hMap.h) {
                     MapView view;
                     view.p = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
                     if (view.p) {
-                        // 关键: 把 mmap 数据复制到 networkPayloads, 让 string_view
-                        // 指向 deque 里的 string (deque push_back 不失效指针)。
-                        // 这样就可以立即关闭 mmap/file 句柄, 不会锁住目标文件导致
-                        // 后续 MoveFileExA 失败。
+                        // 把 mmap 数据复制到 networkPayloads, 让 string_view 指向
+                        // deque 里的 string (deque push_back 不失效指针), 然后立即
+                        // 关闭 mmap/file 句柄, 不锁目标文件 (后续 MoveFileExA 需要)。
                         networkPayloads.emplace_back(
                             std::string((const char*)view.p, fileSize));
                         std::string_view bufferView = networkPayloads.back();
@@ -478,14 +509,26 @@ int main() {
                             bufferView.remove_prefix(3);
                         }
 
-                        // ForEachJsonObject 找 "list" key. v4.2 nap 文件里只有一处
-                        // "list" (在 nap[0] 下), 所以直接命中. (info 块里没有 list)
-                        ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
+                        // UIGF v4.2: 先定位 "nap" 段再找其内层 "list"
+                        // (多游戏 UIGF 文件防串台); 找不到 "nap" 回退全文件搜索。
+                        std::string_view napScope = ScopeToNap(bufferView);
+
+                        // nap[0].uid 在账号对象头部 (list 之前)。
+                        // UIGF 允许 uid 为 string 或 integer, 两种都试。
+                        {
+                            std::string_view u = ExtractJsonValue(napScope, "uid", true);
+                            if (u.empty()) u = ExtractJsonValue(napScope, "uid", false);
+                            if (!u.empty()) uid.assign(u);
+                        }
+
+                        baseLoadOk = ForEachJsonObject(napScope, "list", [&](std::string_view itemStr) {
                             std::string_view raw_id = ExtractJsonValue(itemStr, "id", true);
                             long long parsed_id = 0, parsed_ts = 0;
                             if (!raw_id.empty()) {
                                 std::from_chars(raw_id.data(), raw_id.data() + raw_id.size(), parsed_id);
                             }
+                            // gacha_ts 是自定义 fallback 字段, 不一定有 (秒级);
+                            // 主路径是 time 字符串
                             std::string_view tsStr = ExtractJsonValue(itemStr, "gacha_ts", true);
                             if (!tsStr.empty()) {
                                 std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), parsed_ts);
@@ -493,28 +536,43 @@ int main() {
 
                             ItemType it = ParseItemType(ExtractJsonValue(itemStr, "item_type", true));
 
-                            ExportRecord rec;
-                            rec.id        = parsed_id;
-                            rec.timestamp = parsed_ts;
-                            rec.gachaType = ExtractJsonValue(itemStr, "gacha_type", true);
-                            rec.itemId    = ExtractJsonValue(itemStr, "item_id",    true);
-                            rec.name      = ExtractJsonValue(itemStr, "name",       true);
-                            rec.itemType  = it;
-                            rec.rankType  = ExtractJsonValue(itemStr, "rank_type",  true);
-                            rec.count     = ExtractJsonValue(itemStr, "count",      true);
-                            rec.gachaId   = ExtractJsonValue(itemStr, "gacha_id",   true);
-                            rec.timeStr   = ExtractJsonValue(itemStr, "time",       true);
-                            records.push_back(std::move(rec));
-                            local_ids.insert(parsed_id);
+                            records.push_back(ExportRecord{
+                                parsed_id,
+                                parsed_ts,
+                                ExtractJsonValue(itemStr, "gacha_type", true),
+                                ExtractJsonValue(itemStr, "item_id",   true),
+                                ExtractJsonValue(itemStr, "name",      true),
+                                it,
+                                ExtractJsonValue(itemStr, "rank_type", true),
+                                ExtractJsonValue(itemStr, "count",     true),
+                                ExtractJsonValue(itemStr, "gacha_id",  true),
+                                ExtractJsonValue(itemStr, "time",      true)
+                            });
+                            local_safe_ids.insert(parsed_id);
                         });
                     }
                 }
             }
-            printf("成功加载本地存储的 %zu 条抽卡记录。\n", records.size());
+            if (baseLoadOk) {
+                printf("成功加载本地存储的 %zu 条抽卡记录。\n", records.size());
+            }
         } else {
-            printf("未发现本地记录，将创建新文件。\n");
+            DWORD openErr = GetLastError();
+            if (openErr == ERROR_FILE_NOT_FOUND || openErr == ERROR_PATH_NOT_FOUND) {
+                printf("未发现本地记录,将创建新文件。\n");
+            } else {
+                baseFileExists = true;   // 存在但打不开 (占用/权限): 按"存在但不可用"走下方中止
+            }
         }
     }  // <- Guard 全部析构, 文件完全释放
+
+    if (baseFileExists && !baseLoadOk) {
+        printf("[错误] 本地记录文件 %s 存在, 但无法读取或不含 \"list\" 数组结构\n", uigfFilename.c_str());
+        printf("       (0 字节、被占用、已损坏或非本工具格式)。\n");
+        printf("       为防止本次运行结束时覆盖原有历史, 已中止。请检查或移走该文件后重试。\n");
+        system("pause");
+        return 1;
+    }
 
     printf("\n========================================\n");
     printf("        开始向服务器拉取抽卡数据\n");
@@ -527,27 +585,29 @@ int main() {
     if (hSession.h) {
         hConnect.h = WinHttpConnect(hSession, hostName.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
     }
-    if (!hConnect.h) {
-        printf("网络初始化失败!\n");
-        system("pause"); return 1;
-    }
+    if (!hConnect.h) { printf("网络初始化失败!\n"); system("pause"); return 1; }
 
-    // sessionIds 用 unordered_set (O(1) 去重)
+    // sessionIds: O(1) 去重
     std::pmr::unordered_set<long long> sessionIds(alloc);
-    sessionIds.reserve(5000);
+    sessionIds.reserve(2000);
 
-    std::string authkeyStr(authkey), authkeyVerStr(authkeyVer), signTypeStr(signType);
-    std::string gameBizStr(gameBiz), regionStr(region);
+    std::string authkeyStr(authkey);
+
+    // 翻页中途异常停止保护。本池已吃进部分新记录后再异常停止时, 若照常写盘,
+    // 部分新记录一旦落地, 下次增量拉取在最新记录处即触达老记录而停 —— 中间缺失
+    // 的更早页【永远不会回补】。置位后整次更新中止、不写盘。
+    bool fetchAborted = false;
 
     for (const auto& poolCfg : pools) {
         printf("\n>>> 正在抓取 [%s] ...\n", poolCfg.displayName.c_str());
-        bool reachedExisting = false;
-        std::string endIdCursor = "0";  // 米哈游 API: end_id="0" 表示从最新开始
-        int page = 1, poolFetchedCount = 0;
+        bool hasMore = true, reachedExisting = false;
+        // 米哈游翻页游标: 上一页最后一条的 id【字符串】。直接字符串透传,
+        // 不经 long long 中转 (19 位 id 接近有符号 64 位上限, 字符串最稳)。
+        std::string endIdCursor = "0";
+        int poolFetchedCount = 0;
 
-        while (!reachedExisting) {
-            // 拼路径: 完整透传鉴权三件套, 不解析也不重组 authkey
-            // size=20 是米哈游 API 上限; 不要写 size=50 之类的, 服务器会返回报错或截断
+        while (hasMore && !reachedExisting) {
+            // size=20 是米哈游 API 上限
             std::string currentPath =
                 "/common/gacha_record/api/getGachaLog?"
                 "authkey_ver=" + authkeyVerStr +
@@ -555,142 +615,174 @@ int main() {
                 "&authkey=" + authkeyStr +
                 "&lang=zh-cn"
                 "&game_biz=" + gameBizStr +
-                (regionStr.empty() ? "" : "&region=" + regionStr) +
+                (regionStr.empty() ? std::string() : "&region=" + regionStr) +
                 "&real_gacha_type=" + poolCfg.realGachaType +
                 "&init_log_gacha_base_type=" + poolCfg.initLogBaseType +
                 "&size=20"
                 "&end_id=" + endIdCursor;
 
-            networkPayloads.emplace_back(FetchPath(hConnect, Utf8ToWstring(currentPath)));
+            bool netOk = false;
+            networkPayloads.emplace_back(FetchPath(hConnect, Utf8ToWstring(currentPath), netOk));
             std::string_view resView = networkPayloads.back();
 
-            if (resView.empty()) {
-                printf("  [错误] 网络请求失败或 authkey 已失效。\n");
+            // 三个异常分支: 页 1 失败 (poolFetchedCount == 0, 本池无部分状态, 无缺口
+            // 风险) 维持宽松跳池; 翻页中途失败升级为整次中止 (见 fetchAborted 注释)。
+            if (!netOk || resView.empty()) {
+                printf("  [错误] 网络请求失败、响应不完整或 authkey 已失效。\n");
+                if (poolFetchedCount > 0) fetchAborted = true;
                 break;
             }
 
             // 米哈游统一返回 {"retcode": 0, "message": "OK", "data": {...}}
             std::string_view codeStr = ExtractJsonValue(resView, "retcode", false);
             if (codeStr.empty()) {
-                printf("  [错误] 接口返回非 JSON 数据或格式异常。\n");
+                printf("  [错误] 接口返回了非 JSON 数据或格式异常。\n");
+                if (poolFetchedCount > 0) fetchAborted = true;
                 break;
             }
             if (codeStr != "0") {
+                // 常见: retcode=-101 authkey timeout (有效期约 24 小时)
                 auto msgStr = ExtractJsonValue(resView, "message", true);
-                printf("  [提示] 接口返回信息: %.*s\n",
+                printf("  [提示] 接口返回信息 (retcode=%.*s): %.*s\n",
+                       (int)codeStr.size(), codeStr.data(),
                        (int)msgStr.size(), msgStr.data());
+                if (poolFetchedCount > 0) fetchAborted = true;
                 break;
             }
 
             std::string lastIdInPage;
-            int itemsThisPage = 0;
+            int itemsSeen = 0;
             ForEachJsonObject(resView, "list", [&](std::string_view itemStr) {
-                if (reachedExisting) return;
-                ++itemsThisPage;
+                if (reachedExisting || !hasMore) return;
+                ++itemsSeen;
 
+                // ZZZ 用 "id": 19 位全局递增数字字符串, 全局唯一, 直接做去重键
                 std::string_view rawIdStr = ExtractJsonValue(itemStr, "id", true);
                 if (rawIdStr.empty()) return;
-                lastIdInPage.assign(rawIdStr);  // 用于下一页游标
+                lastIdInPage.assign(rawIdStr);   // 下一页 end_id 游标 (字符串透传)
 
                 long long parsed_id = 0;
                 std::from_chars(rawIdStr.data(), rawIdStr.data() + rawIdStr.size(), parsed_id);
 
-                if (local_ids.contains(parsed_id)) {
+                if (local_safe_ids.contains(parsed_id)) {
                     reachedExisting = true;
-                    printf("  * 触达本地老记录 (ID: %lld)，停止追溯。\n",
-                           parsed_id);
+                    printf("  * 触达本地老记录 (ID: %lld),停止追溯。\n", parsed_id);
                     return;
                 }
                 if (sessionIds.contains(parsed_id)) {
-                    printf("\n  [警告] 遇到重复数据 (ID: %lld)，防死循环中止。\n",
-                           parsed_id);
-                    reachedExisting = true;
+                    printf("\n  [警告] 遇到重复数据 (ID: %lld),防死循环中止。\n", parsed_id);
+                    hasMore = false;
+                    // 重复数据 = 分页游标异常 (服务器返回未推进)。已吃进部分新记录时
+                    // 与下方未拉取的历史之间存在缺口, 升级为整次中止。
+                    if (poolFetchedCount > 0) fetchAborted = true;
                     return;
                 }
                 sessionIds.insert(parsed_id);
 
-                // gacha_ts 在 API 里是字符串(秒级时间戳)
+                // 取首个非空 uid (每条记录都带; 用于 nap[0].uid)
+                if (uid.empty()) {
+                    std::string_view u = ExtractJsonValue(itemStr, "uid", true);
+                    if (u.empty()) u = ExtractJsonValue(itemStr, "uid", false);
+                    if (!u.empty()) uid.assign(u);
+                }
+
+                // 时间戳 fallback (部分实现返回 time_stamp / gacha_ts; 主路径用 time 字符串)
                 long long parsed_ts = 0;
                 std::string_view tsStr = ExtractJsonValue(itemStr, "time_stamp", true);
                 if (tsStr.empty()) tsStr = ExtractJsonValue(itemStr, "gacha_ts", true);
                 if (!tsStr.empty()) {
                     std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), parsed_ts);
                 }
-                // 如果 API 没给时间戳, 用 time 字符串解析 (米哈游 API 一般会返回 time 字符串)
-                // 简化处理: 没解到就用 0; UIGF 写出时优先用 API 的 time 字符串
 
                 ExportRecord rec;
-                rec.id        = parsed_id;
+                rec.safe_id   = parsed_id;
                 rec.timestamp = parsed_ts;
-                rec.gachaType = poolCfg.uigfGachaType;  // 用我们配置的 UIGF gacha_type
-                rec.itemId    = ExtractJsonValue(itemStr, "item_id",   true);
+                // 用我们配置的 UIGF gacha_type (与 real_gacha_type 一致), 不从响应读 —
+                // 部分实现响应里的 gacha_type 可能是派生值, 我们要 UIGF 标准池子分类
+                rec.poolId    = poolCfg.uigfGachaType;
+                rec.item_id   = ExtractJsonValue(itemStr, "item_id",   true);
                 rec.name      = ExtractJsonValue(itemStr, "name",      true);
-                rec.itemType  = ParseItemType(ExtractJsonValue(itemStr, "item_type", true));
-                rec.rankType  = ExtractJsonValue(itemStr, "rank_type", true);
+                rec.item_type = ParseItemType(ExtractJsonValue(itemStr, "item_type", true));
+                rec.rank_type = ExtractJsonValue(itemStr, "rank_type", true);
                 rec.count     = ExtractJsonValue(itemStr, "count",     true);
                 rec.gachaId   = ExtractJsonValue(itemStr, "gacha_id",  true);
-                rec.timeStr   = ExtractJsonValue(itemStr, "time",      true);  // 服务器时区本地时间字符串
-                if (rec.count.empty()) rec.count = "1";
+                rec.timeStr   = ExtractJsonValue(itemStr, "time",      true);  // 服务器时区 (UTC+8)
 
                 records.push_back(std::move(rec));
                 poolFetchedCount++;
+                // rank_type: 2/3/4 = B/A/S, 直接打印 API 原字符串
                 printf("  获取到: %.*s (rank_type=%.*s)\n",
-                       (int)records.back().name.size(),     records.back().name.data(),
-                       (int)records.back().rankType.size(), records.back().rankType.data());
+                    (int)records.back().name.size(),      records.back().name.data(),
+                    (int)records.back().rank_type.size(), records.back().rank_type.data());
             });
 
-            if (reachedExisting) break;
-            if (itemsThisPage == 0 || lastIdInPage.empty()) {
-                // 没数据了 (API 返回空 list 表示池子翻完)
-                break;
-            }
+            if (reachedExisting || !hasMore) break;
+
+            // 米哈游 API 没有 hasMore 字段: 空 list (itemsSeen==0, 含 "list":[])
+            // 或本页没有可用 id → 该池翻完
+            if (itemsSeen == 0 || lastIdInPage.empty()) break;
 
             endIdCursor = lastIdInPage;
-            page++;
-            // 米哈游接口对单 IP 限流较严; 终末地原版 300ms, 这里 500ms 更稳妥
-            Sleep(500);
+            Sleep(500);   // 同池翻页间隔 (米哈游接口对单 IP 限流较严)
         }
-        printf(">>> [%s] 抓取完成，本次新增拉取: %d 条。\n",
+        if (fetchAborted) {
+            printf(">>> [%s] 拉取在翻页中途异常停止。\n", poolCfg.displayName.c_str());
+            break;   // 后续池无需再拉, 本次整体不写盘
+        }
+        printf(">>> [%s] 抓取完成,本次新增拉取: %d 条。\n",
                poolCfg.displayName.c_str(), poolFetchedCount);
-        Sleep(800);  // 切池子也间隔一下
+        Sleep(800);       // 换池间隔
+    }
+
+    if (fetchAborted) {
+        printf("\n========================================\n");
+        printf("本次拉取在翻页中途异常停止: 为避免写入带缺口的记录历史, 本次【不写盘】,\n");
+        printf("原记录文件保持原样。请稍后重新运行以完整拉取。\n");
+        system("pause");
+        return 1;
     }
 
     printf("\n========================================\n");
-    printf("已完成全部抓取！总计记录数: %zu 条。\n", records.size());
+    printf("已完成全部抓取!总计新增拉取了 %zu 条记录。\n", sessionIds.size());
 
-    // 排序: 绝区零的 id 是 19 位全局递增 ID, 直接按 id 升序就是按时间升序.
-    // 不需要终末地版本里"角色武器分区"的 trick.
+    // 排序: ZZZ 的 id 是 19 位全局递增, 单关键字升序 = 时间升序。
+    // (不需要终末地的"角色/武器分区 + 时间 + |id|"三级排序 —— ZZZ id 全局唯一且单调。)
     std::ranges::sort(records, [](const ExportRecord& a, const ExportRecord& b) {
-        return a.id < b.id;
+        return a.safe_id < b.safe_id;
     });
 
     time_t rawtime; time(&rawtime);
     long long export_ts = (long long)rawtime;
 
+    // 安全写入: tmp → 替换
     std::string tempFilename = uigfFilename + ".tmp";
     HANDLE hOut = CreateFileA(tempFilename.c_str(), GENERIC_WRITE, 0, NULL,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
     if (hOut != INVALID_HANDLE_VALUE) {
+        bool writeOk = false;   // 写出是否全部成功; 失败则不替换原文件
         {
             BufferedWriter w(hOut);
             char numBuf[32];
 
             // ==========================================================
-            // UIGF v4.2 输出 - 绝区零(nap)版
+            // UIGF v4.2 输出 - 绝区零 (nap)
             // ----------------------------------------------------------
-            // 文档: https://uigf.org/standards/UIGF.html
+            // 文档地址: https://uigf.org/standards/UIGF.html
             //
-            // 与终末地版本(自定义 endfield key)的差异:
-            //   1. 顶层用 UIGF v4.2 标准支持的 "nap" 数组
-            //   2. nap.list 元素必填字段:
-            //        gacha_type / item_id / time / id
-            //      推荐字段(为了可读性 + 跨工具兼容):
-            //        gacha_id / count / time / name / item_type / rank_type
-            //   3. 时区: 国际服 nap_global 服务器返回的 time 是 UTC+8 (米哈游
-            //      统一服务器时区), timezone 字段写 8.
-            //      若是其他区服, 用本机时区作 fallback.
-            //   4. lang 必须是 schema 里 enum 之一; 中文写 "zh-cn"
+            // ZZZ 是 UIGF v4.2 官方支持的米哈游游戏 (hk4e/hkrpg/nap/hk4e_ugc),
+            // 顶层 key 用标准 "nap"。
+            //
+            // 顶层结构:
+            //   { "info": { ... v4.2 公共字段 ... },
+            //     "nap": [ { "uid", "timezone", "lang", "list": [ ... ] } ] }
+            //
+            // nap 账号级必填: uid / timezone / list
+            // list 元素必填: gacha_type / item_id / time / id
+            // 推荐字段: gacha_id / count / name / item_type / rank_type
+            //
+            // 时区: 米哈游服务器时区 UTC+8, API time 字符串即服务器本地时间 →
+            // nap_cn / nap_global 固定写 8 与 time 自洽; 未知区服 fallback 本机偏移。
             // ==========================================================
 
             time_t t = export_ts;
@@ -707,17 +799,19 @@ int main() {
             auto [ptr, ec] = std::to_chars(numBuf, numBuf + 32, export_ts);
             w.Write(numBuf, (DWORD)(ptr - numBuf));
             w.WriteLit(",\n");
-            w.WriteLit("        \"export_app\": \"ZZZ Exporter\",\n"
+            w.WriteLit("        \"export_app\": \"ZZZ Gacha Exporter\",\n"
                        "        \"export_app_version\": \"v1.0.0\",\n"
                        "        \"version\": \"v4.2\",\n");
+            // export_time 不在 v4.2 必需字段里, 保留作人类可读辅助信息
             w.WriteLit("        \"export_time\": \""); w.Write(tbuf, tlen); w.WriteLit("\"\n    },\n");
 
-            // ---- nap 数组 ----
-            // 米哈游服务器统一 UTC+8, 所以国际服也是 timezone=8
-            // (区别于游戏内 timezone 显示, API time 字段就是 UTC+8 字符串)
+            // ---- nap 数组 (单账号 → 单元素) ----
+            // timezone: nap_cn / nap_global 固定 8 (米哈游服务器时区, 与 time
+            // 字符串自洽); 其它未知区服 fallback 本机偏移 (Windows 上没有 tm_gmtoff,
+            // 用 GetTimeZoneInformation; Bias 符号约定 "UTC = local + Bias",
+            // 东 8 区返回 -480, 取负再除 60)。
             int tzHours = 8;
             if (gameBizStr != "nap_cn" && gameBizStr != "nap_global") {
-                // 未知区服, 用本机时区
                 TIME_ZONE_INFORMATION tzi;
                 DWORD tzKind = GetTimeZoneInformation(&tzi);
                 LONG biasMinutes = tzi.Bias;
@@ -727,7 +821,9 @@ int main() {
             }
 
             w.WriteLit("    \"nap\": [\n        {\n");
-            w.WriteLit("            \"uid\": \"0\",\n");
+            // uid: 真实值 (API 记录 / 基底文件提取); 为空 fallback "0"
+            w.WriteKV("uid", uid.empty() ? std::string_view{"0"} : std::string_view{uid});
+            w.WriteLit(",\n");
             w.WriteLit("            \"timezone\": ");
             auto [tzPtr, tzEc] = std::to_chars(numBuf, numBuf + 32, tzHours);
             w.Write(numBuf, (DWORD)(tzPtr - numBuf));
@@ -740,53 +836,59 @@ int main() {
                 const auto& r = records[i];
                 w.WriteLit("        {\n");
 
-                // 必填: gacha_type
-                w.WriteKV("gacha_type", r.gachaType);       w.WriteLit(",\n");
-                // 推荐: gacha_id
+                // 必填: gacha_type ("1"/"2"/"3"/"5")
+                w.WriteKV("gacha_type", r.poolId);          w.WriteLit(",\n");
+                // 推荐: gacha_id (池子期次 ID; 基底老文件可能没有, 缺省不写)
                 if (!r.gachaId.empty()) {
                     w.WriteKV("gacha_id", r.gachaId);       w.WriteLit(",\n");
                 }
-                // 必填: id
-                w.WriteI64KV("id", r.id, true);             w.WriteLit(",\n");
+                // 必填: id (19 位全局唯一, 引号字符串形态)
+                w.WriteI64KV("id", r.safe_id, true);        w.WriteLit(",\n");
                 // 必填: item_id
-                w.WriteKV("item_id", r.itemId);             w.WriteLit(",\n");
-                // 推荐: count
+                w.WriteKV("item_id", r.item_id);            w.WriteLit(",\n");
+                // 推荐: count (缺省补 "1")
                 w.WriteKV("count", r.count.empty() ? std::string_view{"1"} : r.count);
                 w.WriteLit(",\n");
-                // 必填: time
-                // 优先用 API 返回的 time 字符串 (服务器时区 UTC+8 下的本地时间, 已经是 UIGF
-                // 要求的 "YYYY-MM-DD HH:MM:SS" 格式). 这样写出的时间与 timezone=8 自洽.
-                // 只有当读取本地老文件且老文件没存 time 字段时才 fallback 到 timestamp 重建.
+                // 必填: time —— 优先 API 原 time 字符串 (服务器时区, 已是 UIGF
+                // 要求的 "YYYY-MM-DD HH:MM:SS" 格式), 与 timezone 自洽;
+                // 老记录缺 time 才 fallback 秒级时间戳重建 (WriteTimeKV 收毫秒)
                 if (!r.timeStr.empty()) {
                     w.WriteKV("time", r.timeStr);
                 } else {
-                    w.WriteTimeKV("time", r.timestamp);
+                    w.WriteTimeKV("time", r.timestamp * 1000);
                 }
                 w.WriteLit(",\n");
                 // 推荐: name / item_type / rank_type
                 w.WriteKV("name", r.name);                  w.WriteLit(",\n");
-                w.WriteKV("item_type", ItemTypeToStr(r.itemType));
+                w.WriteKV("item_type", ItemTypeToStr(r.item_type));
                 w.WriteLit(",\n");
-                w.WriteKV("rank_type", r.rankType);
-
-                w.WriteLit("\n        }");
+                w.WriteKV("rank_type", r.rank_type);
+                w.WriteLit("\n");
+                w.WriteLit("        }");
                 if (i < n - 1) w.WriteLit(",");
                 w.WriteLit("\n");
             }
 
             w.WriteLit("            ]\n        }\n    ]\n}\n");
+            w.Flush();              // 显式收尾 flush 并捕获结果 (析构里那次因 pos==0 成 no-op)
+            writeOk = w.ok;
         }
         CloseHandle(hOut);
 
-        if (MoveFileExA(tempFilename.c_str(), uigfFilename.c_str(),
-                        MOVEFILE_REPLACE_EXISTING)) {
-            printf("已成功更新记录并保存至: %s\n", uigfFilename.c_str());
+        if (!writeOk) {
+            // 写入中途失败 (磁盘满 / IO 错误): 绝不能用半截 tmp 覆盖好的原文件
+            DeleteFileA(tempFilename.c_str());
+            printf("写入失败 (磁盘空间不足或 IO 错误)!已保留原记录文件,未做替换。\n");
+        } else if (MoveFileExA(tempFilename.c_str(), uigfFilename.c_str(),
+                               MOVEFILE_REPLACE_EXISTING)) {
+            printf("已成功更新记录并保存至: %s (UID: %s)\n",
+                   uigfFilename.c_str(), uid.empty() ? "未知" : uid.c_str());
         } else {
-            printf("文件覆盖失败！请手动将 %s 重命名为 %s\n",
+            printf("文件覆盖失败!请手动将 %s 重命名为 %s\n",
                    tempFilename.c_str(), uigfFilename.c_str());
         }
     } else {
-        printf("临时文件创建失败！请检查目录权限。\n");
+        printf("临时文件创建失败!请检查目录权限。\n");
     }
 
     system("pause");
