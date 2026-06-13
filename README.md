@@ -23,4 +23,4 @@ Gacha tracker and visualizer for Zenless Zone Zero. Built with C++20 & Win32 API
 > ### Apple (macOS & iOS)
 > Please check the Apple SwiftUI version here 请查看该SwiftUI版本: [ZZZ-Gacha-Apple](https://github.com/shangyuan0818/ZZZ-Gacha-Apple)
 ## Demonstration 效果展示
-<img width="962" height="668" alt="image" src="https://github.com/user-attachments/assets/c0a5bf55-8d8a-42c5-9c33-544dd1a00052" />
+<img width="947" height="878" alt="image" src="https://github.com/user-attachments/assets/a210ea65-72b4-461f-9558-21f824cfbca2" />
