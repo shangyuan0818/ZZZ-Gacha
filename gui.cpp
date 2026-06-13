@@ -35,6 +35,9 @@
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "user32.lib")    // CreateWindowExW / SendMessageW / MessageBoxW / GetMessageW ...
+#pragma comment(lib, "gdi32.lib")     // BitBlt / CreateCompatibleDC / SelectObject / CreateFontW ...
+#pragma comment(lib, "shell32.lib")   // DragAcceptFiles / DragQueryFileW / DragFinish
 
 // ---------------------------------------------------------
 // [枚举降维]
@@ -2013,7 +2016,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
             DPIScale(20), DPIScale(105), DPIScale(1220), DPIScale(245), hwnd, NULL, NULL, NULL);
 
-        DWORD tabStops[] = {50};        DWORD tabStops[] = {50};
+        DWORD tabStops[] = {50};
         SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
         SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 

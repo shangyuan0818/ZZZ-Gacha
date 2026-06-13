@@ -2,9 +2,9 @@ Prerequisites: MSVC (Visual Studio Build Tools), run in "Developer Command Promp
 
 For exporter:
 
-cl /std:c++20 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE /MT main.cpp /link /STACK:4194304
+cl /std:c++20 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE /MT main.cpp /link
 
 
 For GUI:
 
-cl /std:c++20 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE /MT gui.cpp /link /STACK:4194304
+cl /std:c++20 /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE /MT gui.cpp /link
